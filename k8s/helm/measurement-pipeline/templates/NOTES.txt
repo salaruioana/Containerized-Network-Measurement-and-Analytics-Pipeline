@@ -1,0 +1,2 @@
+Helm prints this file after helm install. Tell the user how to reach the
+gateway, for example with the NodePort and `minikube ip`.

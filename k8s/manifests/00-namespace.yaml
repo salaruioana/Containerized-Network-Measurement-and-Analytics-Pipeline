@@ -1,0 +1,5 @@
+# All objects in this directory use this namespace.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aic

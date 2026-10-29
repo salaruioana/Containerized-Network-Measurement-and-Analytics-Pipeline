@@ -1,0 +1,4 @@
+# ConfigMaps. Put the shared, non-secret environment of the four services here:
+# hosts, ports, S3 endpoint and region, LOG_LEVEL. Put garage.toml here too.
+#
+# Empty on purpose.

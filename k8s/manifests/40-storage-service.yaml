@@ -1,0 +1,4 @@
+# Storage service. Add a Deployment only. It is a queue consumer, so no client
+# connects to it.
+#
+# Empty on purpose.

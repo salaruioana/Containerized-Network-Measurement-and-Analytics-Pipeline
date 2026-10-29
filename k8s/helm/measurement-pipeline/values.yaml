@@ -1,0 +1,6 @@
+# Put all values that change between two installs here, not in the templates:
+# image names and tags, replica counts, credentials, volume sizes, and the
+# gateway NodePort.
+#
+# Empty on purpose.
+{}

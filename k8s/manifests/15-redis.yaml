@@ -1,0 +1,4 @@
+# Redis. Add a PersistentVolumeClaim, a Deployment or StatefulSet with
+# append-only persistence, and a Service.
+#
+# Empty on purpose.

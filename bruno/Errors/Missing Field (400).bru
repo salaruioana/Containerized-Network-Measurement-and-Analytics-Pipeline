@@ -1,0 +1,32 @@
+meta {
+  name: Missing Field (400)
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/measurements
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "source_host": "h1",
+    "metric": "latency",
+    "values_ms": [10, 11]
+  }
+}
+
+assert {
+  res.status: eq 400
+}
+
+docs {
+  The body has no `target_host`. The gateway rejects it before it creates a
+  job. No job id comes back, and no message goes on a queue.
+}

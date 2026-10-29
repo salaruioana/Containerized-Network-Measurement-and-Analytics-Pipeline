@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+# Run from this directory: `pytest`. The packages are importable from here,
+# which is also how they are laid out inside the images.
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,0 +1,33 @@
+meta {
+  name: No Samples (400)
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/measurements
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "source_host": "h1",
+    "target_host": "h2",
+    "metric": "latency",
+    "values_ms": []
+  }
+}
+
+assert {
+  res.status: eq 400
+}
+
+docs {
+  The schema accepts this body, but a measurement needs at least one sample.
+  The schema lets an empty list through, so write this check in the gateway.
+}

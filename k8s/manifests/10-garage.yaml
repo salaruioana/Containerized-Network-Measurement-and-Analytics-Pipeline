@@ -1,0 +1,7 @@
+# Garage. Add PersistentVolumeClaims for metadata and data, a Deployment or
+# StatefulSet, and a Service. Create the two buckets from
+# aic_common.storage.Buckets before the services write to them.
+#
+# A PVC is ReadWriteOnce. Find out what a rolling update does to it.
+#
+# Empty on purpose.

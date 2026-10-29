@@ -1,0 +1,38 @@
+meta {
+  name: Analyze Stored Measurement (Workflow C)
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/measurements/:measurementId/analyze
+  body: json
+  auth: none
+}
+
+params:path {
+  measurementId: {{measurementId}}
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "analysis": "latency_summary",
+    "threshold_ms": 25
+  }
+}
+
+assert {
+  res.status: eq 202
+}
+
+script:post-response {
+  // Saves the ids. The Get requests read them, so you do not copy them.
+  if (res.status === 202) {
+    bru.setVar("jobId", res.body.job_id);
+    bru.setVar("reportId", res.body.measurement_id.replace(/^m-/, "r-"));
+  }
+}

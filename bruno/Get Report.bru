@@ -1,0 +1,31 @@
+meta {
+  name: Get Report
+  type: http
+  seq: 7
+}
+
+get {
+  url: {{baseUrl}}/reports/:reportId
+  body: none
+  auth: none
+}
+
+params:path {
+  reportId: {{reportId}}
+}
+
+params:query {
+  ~format: csv
+}
+
+assert {
+  res.status: eq 200
+}
+
+docs {
+  Returns the report as JSON. Enable the `format=csv` query param to get the
+  same report as CSV. The gateway renders the CSV on read and never stores it.
+  Thus the CSV always matches the latest analysis.
+
+  A measurement has exactly one report, however often you analyse it.
+}

@@ -1,0 +1,34 @@
+name: aic-template
+
+# Empty on purpose.
+#
+# §1.5.1 asks you for a docker-compose.yml that starts the complete system, so
+# writing it is part of the work. What has to end up in here:
+#
+#   rabbitmq           the broker. The queue names are fixed in
+#                      aic_common.messaging.Queues; declaring them is yours
+#   garage             S3-compatible object storage. Two buckets, named in
+#                      aic_common.storage.Buckets. Single-node is fine, and it
+#                      needs a garage.toml of its own
+#   redis              job state and measurement metadata, append-only
+#                      persistence on a volume
+#   api-gateway        built from ./services, publishes port 8080
+#   storage-service    built from ./services
+#   analytics-service  built from ./services
+#   report-service     built from ./services
+#
+# Build a service image with:  docker build --target <name> ./services
+#
+# Both Redis and Garage need a named volume. `docker compose down` then `up`
+# has to preserve submitted jobs and stored measurements; only `down -v` should
+# wipe them. Also worth getting right: healthchecks on the infrastructure,
+# depends_on so the services wait for it, and every credential and hostname
+# coming from the environment rather than written inline. See .env.example.
+#
+# One more thing to think about: three of the four services are queue
+# consumers. Nothing ever connects to them.
+
+services: {}
+
+networks:
+  aicnet:

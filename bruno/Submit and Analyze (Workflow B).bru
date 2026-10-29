@@ -1,0 +1,41 @@
+meta {
+  name: Submit and Analyze (Workflow B)
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/measurements/analyze
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "source_host": "h1",
+    "target_host": "h2",
+    "metric": "latency",
+    "values_ms": [10, 11, 9, 45, 12],
+    "unit": "ms",
+    "timestamp": "2026-01-01T12:00:00Z",
+    "analysis": "latency_summary",
+    "threshold_ms": 30
+  }
+}
+
+assert {
+  res.status: eq 202
+}
+
+script:post-response {
+  // Saves the ids. The Get requests read them, so you do not copy them.
+  if (res.status === 202) {
+    bru.setVar("jobId", res.body.job_id);
+    bru.setVar("measurementId", res.body.measurement_id);
+    bru.setVar("reportId", res.body.measurement_id.replace(/^m-/, "r-"));
+  }
+}

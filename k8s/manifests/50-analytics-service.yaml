@@ -1,0 +1,5 @@
+# Analytics service. Add a Deployment only.
+#
+# At least one stateless service must run with more than one replica.
+#
+# Empty on purpose.

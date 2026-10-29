@@ -1,0 +1,15 @@
+meta {
+  name: Unknown Job (404)
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/jobs/job-does-not-exist
+  body: none
+  auth: none
+}
+
+assert {
+  res.status: eq 404
+}

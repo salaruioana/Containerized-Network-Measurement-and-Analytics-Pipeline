@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8.0,<9
+# FastAPI's TestClient runs the app in-process, no server needed.
+httpx>=0.27,<1

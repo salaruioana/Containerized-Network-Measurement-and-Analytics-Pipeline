@@ -1,0 +1,31 @@
+meta {
+  name: Analyze Unknown Measurement (404)
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/measurements/m-does-not-exist/analyze
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "analysis": "latency_summary"
+  }
+}
+
+assert {
+  res.status: eq 404
+}
+
+docs {
+  Workflow C on a measurement that does not exist. The gateway must answer 404
+  before it creates a job. A job that fails later in the analytics service is
+  wrong.
+}

@@ -1,0 +1,37 @@
+# Configuration for measurement_simulator.py.
+#
+# The simulator plays the network hosts. In each round, each source host pings
+# each of its targets. Each ping result goes to the gateway as one latency
+# measurement.
+
+# API base URL. The --api option overrides it.
+# Compose: http://localhost:8080. Minikube: http://<minikube ip>:<NodePort>.
+api: http://localhost:8080
+
+# Host header, for an ingress that routes by hostname. Leave it empty for
+# Compose and for a NodePort Service.
+host_header: ""
+
+# Number of rounds. Use 0 to run until Ctrl-C.
+rounds: 10
+
+# Pause between two rounds, in seconds.
+interval_s: 5
+
+# Pings per measurement. This is the length of values_ms.
+samples: 10
+
+# Latency range in milliseconds. Set max above the analysis threshold
+# (default 30) to get some anomalies.
+latency_ms:
+  min: 5
+  max: 40
+
+# Each source host and the hosts it pings. Names must match [A-Za-z0-9._-]+.
+hosts:
+  h1: [h2, h3]
+  h2: [h3]
+
+# false: send to POST /measurements (Workflow A).
+# true:  send to POST /measurements/analyze (Workflow B).
+analyze: false

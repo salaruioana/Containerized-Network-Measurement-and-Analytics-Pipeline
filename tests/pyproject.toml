@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+# Black-box suite: it only ever speaks HTTP to your gateway.
+testpaths = ["."]
+addopts = "-q"

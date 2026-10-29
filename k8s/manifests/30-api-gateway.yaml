@@ -1,0 +1,5 @@
+# API gateway. Add a Deployment and a NodePort Service. The NodePort lets
+# clients outside the cluster reach port 8080, for example
+# scripts/measurement_simulator.py.
+#
+# Empty on purpose.
