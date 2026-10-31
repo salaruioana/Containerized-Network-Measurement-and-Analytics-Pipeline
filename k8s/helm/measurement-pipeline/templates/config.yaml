@@ -1,4 +1,0 @@
-# ConfigMap. Put the shared, non-secret environment of the four services here,
-# and garage.toml.
-#
-# Empty on purpose.

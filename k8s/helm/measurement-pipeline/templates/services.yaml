@@ -1,5 +1,0 @@
-# The four application Deployments, and a NodePort Service for the API gateway
-# only. The three consumers read from RabbitMQ, so no client connects to them.
-# At least one service must run with more than one replica.
-#
-# Empty on purpose.
