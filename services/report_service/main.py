@@ -12,9 +12,34 @@ Run it with `python -m report_service.main`.
 """
 
 from __future__ import annotations
-from aic_common.contract import MEASUREMENT_PREFIX, REPORT_PREFIX
+
+import json
+import logging
+import os
+import time
+
+import boto3
+import pika
+import redis
+
+
+from aic_common.contract import (
+    AnalyticsResult,
+    Buckets,
+    JOB_PREFIX,
+    JobStatus,
+    MEASUREMENT_PREFIX,
+    Queues,
+    REPORT_PREFIX,
+)
 
 SERVICE_NAME = "report-service"
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(SERVICE_NAME)
 
 def report_id_for(measurement_id: str) -> str:
     if not measurement_id.startswith(MEASUREMENT_PREFIX):
@@ -33,6 +58,58 @@ def build_report(job_id: str, measurement_id: str, result: dict) -> dict:
         "measurement_id":measurement_id,
         "result":result
     }
+    
+def connect_redis() -> redis.Redis:
+    """Connect to Redis, retrying while the service is unavailable."""
+    client = redis.Redis(
+        host=os.getenv("REDIS_HOST", "redis"),
+        port=int(os.getenv("REDIS_PORT", "6379")),
+        decode_responses=True,
+    )
+
+    while True:
+        try:
+            client.ping()
+            logger.info("Connected to Redis")
+            return client
+        except redis.RedisError:
+            logger.warning("Redis unavailable. Retrying in 5 seconds...")
+            time.sleep(5)
+
+def create_s3_client():
+    """Create an S3 client configured for Garage."""
+    return boto3.client(
+        "s3",
+        endpoint_url=os.environ["S3_ENDPOINT"],
+        region_name=os.getenv("S3_REGION", "garage"),
+        aws_access_key_id=os.environ["S3_ACCESS_KEY"],
+        aws_secret_access_key=os.environ["S3_SECRET_KEY"],
+    )
+
+def connect_rabbitmq() -> pika.BlockingConnection:
+    """Connect to RabbitMQ, retrying while the broker is unavailable."""
+    credentials = pika.PlainCredentials(
+        os.getenv("RABBITMQ_USER", "guest"),
+        os.getenv("RABBITMQ_PASSWORD", "guest"),
+    )
+
+    while True:
+        try:
+            connection = pika.BlockingConnection(
+                pika.ConnectionParameters(
+                    host=os.getenv("RABBITMQ_HOST", "rabbitmq"),
+                    port=int(os.getenv("RABBITMQ_PORT", "5672")),
+                    credentials=credentials,
+                    heartbeat=60,
+                    blocked_connection_timeout=30,
+                )
+            )
+            logger.info("Connected to RabbitMQ")
+            return connection
+
+        except (pika.exceptions.AMQPConnectionError, OSError):
+            logger.warning("RabbitMQ unavailable. Retrying in 5 seconds...")
+            time.sleep(5)
 
 
 def main() -> None:
