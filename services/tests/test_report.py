@@ -1,7 +1,7 @@
 
 import pytest
 
-from services.report_service.main import report_id_for, build_report
+from report_service.main import report_id_for, build_report
 
 
 def test_report_id_for():
