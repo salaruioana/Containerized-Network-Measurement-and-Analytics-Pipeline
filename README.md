@@ -1,93 +1,95 @@
-# Group 05
+# Containerized Network Measurement and Analytics Pipeline
 
+Four Python services (API gateway, storage, QoS analytics, report) connected by RabbitMQ, with
+job state in Redis and raw measurements and reports in Garage (S3). The fixed interface is in
+[`CONTRACT.md`](CONTRACT.md), the architecture in [`documentation`](documentation/ARCHITECTURE.md).
 
+## Run with Docker Compose
 
-## Getting started
-
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin https://nemo.infosys.tuwien.ac.at/aic26/group-05.git
-git branch -M main
-git push -uf origin main
+```bash
+cp .env.example .env
+docker compose up --build          # or: make up (detached)
+curl -s localhost:8080/health
 ```
 
-## Integrate with your tools
+| Container | Role | Port |
+|---|---|---|
+| `api-gateway` | the only HTTP service | `8080` |
+| `storage-service`, `analytics-service`, `report-service` | queue consumers | none |
+| `rabbitmq` | message broker | internal |
+| `redis` | job state and measurement metadata, append-only | internal |
+| `garage` | S3 object store, single-node mode, imports the S3 key from `.env` | internal |
+| `garage-init` | one-shot: creates the buckets `measurements`, `reports`, `errors` | none |
 
-* [Set up project integrations](https://nemo.infosys.tuwien.ac.at/aic26/group-05/-/settings/integrations)
+- Redis, Garage and RabbitMQ use named volumes. `docker compose down` keeps all data;
+  `docker compose down -v` (`make reset`) deletes it.
+- Credentials are applied when a volume is first created. After changing them in `.env`, run
+  `docker compose down -v`.
+- Scale a consumer: `docker compose up -d --scale analytics-service=2`.
 
-## Collaborate with your team
+**Development overlay.** `make up-dev` (`docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build -d`)
+also publishes RabbitMQ (`5672`, management UI on `http://localhost:15672`), Redis (`6379`)
+and Garage S3 (`3900`) on localhost, so a service can run on the host while you work on it:
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+```bash
+docker compose stop storage-service
+cd services && set -a && . ../.env && set +a
+RABBITMQ_HOST=localhost REDIS_HOST=localhost S3_ENDPOINT=http://localhost:3900 python -m storage_service.main
+```
 
-## Test and Deploy
+## Environment
 
-Use the built-in continuous integration in GitLab.
+Every service reads its configuration from these variables. Compose takes them from `.env`;
+Kubernetes from `k8s/manifests/05-config.yaml` and `06-secret.yaml`.
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+| Variable | Compose value |
+|---|---|
+| `RABBITMQ_HOST`, `RABBITMQ_PORT` | `rabbitmq`, `5672` |
+| `RABBITMQ_USER`, `RABBITMQ_PASSWORD` | from `.env` |
+| `REDIS_HOST`, `REDIS_PORT` | `redis`, `6379` |
+| `S3_ENDPOINT`, `S3_REGION` | `http://garage:3900`, `garage` |
+| `S3_ACCESS_KEY`, `S3_SECRET_KEY` | from `.env` |
+| `LOG_LEVEL` | `INFO` |
 
-***
+S3 client: `boto3.client("s3", endpoint_url=S3_ENDPOINT, region_name=S3_REGION, aws_access_key_id=S3_ACCESS_KEY, aws_secret_access_key=S3_SECRET_KEY)`.
+The buckets exist before the services start; services never create buckets. RabbitMQ starts
+empty; the services declare the queues they use.
 
-# Editing this README
+## Tests
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+```bash
+cd services && pytest                                   # unit tests (make test)
+cd tests && API_BASE_URL=http://localhost:8080 pytest   # public API tests (make test-api)
+python3 scripts/measurement_simulator.py                # ping simulator (make simulate)
+```
 
-## Suggestions for a good README
+Manual requests: open `bruno/` as a Bruno collection.
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+## Run on Kubernetes (Minikube)
 
-## Name
-Choose a self-explaining name for your project.
+```bash
+minikube start
+cp .env.example .env
+make k8s-images                            # docker compose build + minikube image load
+kubectl apply -f k8s/manifests/
+kubectl get pods,deployments,services,pvc,jobs -n aic
+kubectl port-forward -n aic svc/api-gateway 18080:8080
+curl -s http://127.0.0.1:18080/health
+```
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+- Namespace `aic`. The gateway is also on NodePort `30080` (`http://$(minikube ip):30080`).
+- `api-gateway` and `analytics-service` run 2 replicas; storage and report run 1.
+- Redis, Garage and RabbitMQ use PVCs with the `Recreate` strategy, so a rollout never mounts a
+  `ReadWriteOnce` volume twice. The `garage-init` Job creates the buckets.
+- After rebuilding images: `make k8s-images k8s-restart`. Remove everything, data included:
+  `kubectl delete namespace aic`.
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+## Windows (PowerShell)
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+The Makefile works with GNU Make on Windows. Commands in this README are written for bash; in
+PowerShell use `curl.exe` instead of `curl`, `Select-String` instead of `grep`, and a pipe instead
+of `<`, e.g. `Get-Content scripts/list_buckets.py | kubectl exec -i -n aic deploy/api-gateway -- python -`.
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+## Evidence
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+The checklist for the report is in [`evidence/README.md`](evidence/README.md).

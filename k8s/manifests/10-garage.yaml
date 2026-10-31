@@ -1,7 +1,114 @@
-# Garage. Add PersistentVolumeClaims for metadata and data, a Deployment or
-# StatefulSet, and a Service. Create the two buckets from
-# aic_common.storage.Buckets before the services write to them.
-#
-# A PVC is ReadWriteOnce. Find out what a rolling update does to it.
-#
-# Empty on purpose.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: garage-meta
+  namespace: aic
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: garage-data
+  namespace: aic
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: garage
+  namespace: aic
+spec:
+  replicas: 1
+  # RWO volumes: the old pod must release them before the new one starts.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: garage
+  template:
+    metadata:
+      labels:
+        app: garage
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: garage
+          image: dxflrs/garage:v2.4.1
+          command: ["/garage", "server", "--single-node", "--default-access-key"]
+          envFrom:
+            - secretRef:
+                name: garage-secrets
+          env:
+            - name: GARAGE_DEFAULT_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: {name: pipeline-secrets, key: S3_ACCESS_KEY}
+            - name: GARAGE_DEFAULT_SECRET_KEY
+              valueFrom:
+                secretKeyRef: {name: pipeline-secrets, key: S3_SECRET_KEY}
+          ports:
+            - {name: s3, containerPort: 3900}
+            - {name: rpc, containerPort: 3901}
+            - {name: admin, containerPort: 3903}
+          readinessProbe:
+            httpGet: {path: /health, port: admin}
+            periodSeconds: 5
+          volumeMounts:
+            - {name: config, mountPath: /etc/garage.toml, subPath: garage.toml}
+            - {name: meta, mountPath: /var/lib/garage/meta}
+            - {name: data, mountPath: /var/lib/garage/data}
+      volumes:
+        - name: config
+          configMap:
+            name: garage-config
+        - name: meta
+          persistentVolumeClaim:
+            claimName: garage-meta
+        - name: data
+          persistentVolumeClaim:
+            claimName: garage-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: garage
+  namespace: aic
+spec:
+  selector:
+    app: garage
+  ports:
+    - {name: s3, port: 3900, targetPort: s3}
+    - {name: admin, port: 3903, targetPort: admin}
+---
+# Creates the buckets (s3/garage_init.py). Idempotent, so re-running it is safe.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: garage-init
+  namespace: aic
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      enableServiceLinks: false
+      restartPolicy: OnFailure
+      containers:
+        - name: garage-init
+          image: aic/garage-init:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: GARAGE_ADMIN_URL
+              value: http://garage:3903
+            - name: GARAGE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef: {name: garage-secrets, key: GARAGE_ADMIN_TOKEN}
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: {name: pipeline-secrets, key: S3_ACCESS_KEY}
