@@ -85,6 +85,65 @@ def create_s3_client():
         aws_access_key_id=os.environ["S3_ACCESS_KEY"],
         aws_secret_access_key=os.environ["S3_SECRET_KEY"],
     )
+    
+def process_message(
+    payload: dict,
+    redis_client: redis.Redis,
+    s3_client,
+) -> None:
+    """Generate and store one report, then update its job in Redis."""
+
+    job_id = payload["job_id"]
+    measurement_id = payload["measurement_id"]
+
+    if not job_id.startswith(JOB_PREFIX) or job_id == JOB_PREFIX:
+        raise ValueError("Invalid job_id")
+
+    # The analysis result contains all message fields except job_id.
+    result_data = {
+        key: value
+        for key, value in payload.items()
+        if key != "job_id"
+    }
+
+    # Validate the incoming analysis result against the shared contract.
+    result = AnalyticsResult.model_validate(result_data)
+    result_dict = result.model_dump(exclude_none=True)
+
+    report = build_report(job_id, measurement_id, result_dict)
+
+    # Store the report. Repeated messages overwrite the same object.
+    try:
+        s3_client.put_object(
+            Bucket=Buckets.REPORTS,
+            Key=report["report_id"],
+            Body=json.dumps(report, ensure_ascii=False).encode("utf-8"),
+            ContentType="application/json",
+        )
+        logger.info("Stored report %s", report["report_id"])
+
+    except Exception:
+        logger.exception("Could not store report %s", report["report_id"])
+
+        # Report storage failed: update the job status.
+        redis_client.hset(
+            f"job:{job_id}",
+            mapping={
+                "status": JobStatus.FAILED_REPORT_STORAGE.value,
+            },
+        )
+        raise
+
+    # Update only the fields owned by Report Service.
+    redis_client.hset(
+        f"job:{job_id}",
+        mapping={
+            "report_id": report["report_id"],
+            "status": JobStatus.COMPLETED.value,
+        },
+    )
+
+    logger.info("Job %s completed", job_id)
 
 def connect_rabbitmq() -> pika.BlockingConnection:
     """Connect to RabbitMQ, retrying while the broker is unavailable."""
