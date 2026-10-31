@@ -12,8 +12,27 @@ Run it with `python -m report_service.main`.
 """
 
 from __future__ import annotations
+from aic_common.contract import MEASUREMENT_PREFIX, REPORT_PREFIX
 
 SERVICE_NAME = "report-service"
+
+def report_id_for(measurement_id: str) -> str:
+    if not measurement_id.startswith(MEASUREMENT_PREFIX):
+        raise ValueError("Invalid measurement_id")
+    
+    suffix = measurement_id[len(MEASUREMENT_PREFIX):]
+    if not suffix:
+        raise ValueError("Invalid measurement_id")
+    
+    return f"{REPORT_PREFIX}{suffix}"
+
+def build_report(job_id: str, measurement_id: str, result: dict) -> dict:
+    return {
+        "report_id": report_id_for(measurement_id),
+        "job_id":job_id,
+        "measurement_id":measurement_id,
+        "result":result
+    }
 
 
 def main() -> None:
