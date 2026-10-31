@@ -1,34 +1,133 @@
-name: aic-template
+name: measurement-pipeline
 
-# Empty on purpose.
-#
-# §1.5.1 asks you for a docker-compose.yml that starts the complete system, so
-# writing it is part of the work. What has to end up in here:
-#
-#   rabbitmq           the broker. The queue names are fixed in
-#                      aic_common.messaging.Queues; declaring them is yours
-#   garage             S3-compatible object storage. Two buckets, named in
-#                      aic_common.storage.Buckets. Single-node is fine, and it
-#                      needs a garage.toml of its own
-#   redis              job state and measurement metadata, append-only
-#                      persistence on a volume
-#   api-gateway        built from ./services, publishes port 8080
-#   storage-service    built from ./services
-#   analytics-service  built from ./services
-#   report-service     built from ./services
-#
-# Build a service image with:  docker build --target <name> ./services
-#
-# Both Redis and Garage need a named volume. `docker compose down` then `up`
-# has to preserve submitted jobs and stored measurements; only `down -v` should
-# wipe them. Also worth getting right: healthchecks on the infrastructure,
-# depends_on so the services wait for it, and every credential and hostname
-# coming from the environment rather than written inline. See .env.example.
-#
-# One more thing to think about: three of the four services are queue
-# consumers. Nothing ever connects to them.
+# Environment of the four services. Everything comes from .env (see .env.example).
+x-app-env: &app-env
+  RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+  RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+  RABBITMQ_USER: ${RABBITMQ_USER:?run cp .env.example .env}
+  RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?run cp .env.example .env}
+  REDIS_HOST: ${REDIS_HOST:-redis}
+  REDIS_PORT: ${REDIS_PORT:-6379}
+  S3_ENDPOINT: ${S3_ENDPOINT:-http://garage:3900}
+  S3_REGION: ${S3_REGION:-garage}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:?run cp .env.example .env}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:?run cp .env.example .env}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
-services: {}
+x-app: &app
+  environment: *app-env
+  depends_on:
+    rabbitmq:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    garage-init:
+      condition: service_completed_successfully
+  restart: unless-stopped
+  networks: [aicnet]
+
+services:
+  rabbitmq:
+    image: rabbitmq:4.3-management-alpine
+    # Fixed hostname: RabbitMQ keeps its data under rabbit@<hostname>.
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    networks: [aicnet]
+
+  redis:
+    image: redis:8.2-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [aicnet]
+
+  garage:
+    image: dxflrs/garage:v2.4.1
+    # Applies the single-node layout and imports the shared S3 key on startup.
+    command: ["/garage", "server", "--single-node", "--default-access-key"]
+    environment:
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:?run cp .env.example .env}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:?run cp .env.example .env}
+      GARAGE_DEFAULT_ACCESS_KEY: ${S3_ACCESS_KEY}
+      GARAGE_DEFAULT_SECRET_KEY: ${S3_SECRET_KEY}
+    volumes:
+      - ./s3/garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [aicnet]
+
+  garage-init:
+    build: ./s3
+    image: aic/garage-init:local
+    environment:
+      GARAGE_ADMIN_URL: http://garage:3903
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+    depends_on:
+      garage:
+        condition: service_healthy
+    networks: [aicnet]
+
+  api-gateway:
+    <<: *app
+    build:
+      context: ./services
+      target: api-gateway
+    image: aic/api-gateway:local
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  storage-service:
+    <<: *app
+    build:
+      context: ./services
+      target: storage-service
+    image: aic/storage-service:local
+
+  analytics-service:
+    <<: *app
+    build:
+      context: ./services
+      target: analytics-service
+    image: aic/analytics-service:local
+
+  report-service:
+    <<: *app
+    build:
+      context: ./services
+      target: report-service
+    image: aic/report-service:local
+
+volumes:
+  rabbitmq-data:
+  redis-data:
+  garage-meta:
+  garage-data:
 
 networks:
   aicnet:

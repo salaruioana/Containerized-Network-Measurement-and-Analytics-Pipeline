@@ -1,0 +1,16 @@
+# Optional overlay for development: publishes the infrastructure on localhost so a
+# service can run on the host (python -m ...) against the containers, and the
+# RabbitMQ management UI is reachable at http://localhost:15672.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+services:
+  rabbitmq:
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+  redis:
+    ports:
+      - "127.0.0.1:6379:6379"
+  garage:
+    ports:
+      - "127.0.0.1:3900:3900"

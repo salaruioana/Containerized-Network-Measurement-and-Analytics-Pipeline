@@ -1,4 +1,0 @@
-# Garage. Add PersistentVolumeClaims, a Deployment or StatefulSet, and a Service.
-# A PVC is ReadWriteOnce. Find out what a rolling update does to it.
-#
-# Empty on purpose.

@@ -1,4 +1,26 @@
-# Storage service. Add a Deployment only. It is a queue consumer, so no client
-# connects to it.
-#
-# Empty on purpose.
+# Queue consumer: nothing connects to it, so it has no Service.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: storage-service
+  namespace: aic
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: storage-service
+  template:
+    metadata:
+      labels:
+        app: storage-service
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: storage-service
+          image: aic/storage-service:local
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: pipeline-config
+            - secretRef:
+                name: pipeline-secrets

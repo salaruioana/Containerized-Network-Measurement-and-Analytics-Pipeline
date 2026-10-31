@@ -5,10 +5,8 @@
 #
 #   docker build --target <api-gateway|storage-service|analytics-service|report-service> .
 #
-# The build context is this directory.
-#
-# The api-gateway target is filled in as a worked example. The other three are
-# yours; they are consumers, so they run a module rather than a web server.
+# The build context is this directory. The three consumers run a module and
+# expose no port: nothing connects to them.
 
 FROM python:3.12-slim AS base
 WORKDIR /app
@@ -29,9 +27,14 @@ COPY api_gateway api_gateway
 EXPOSE 8080
 CMD ["uvicorn", "api_gateway.main:app", "--host", "0.0.0.0", "--port", "8080"]
 
-# TODO: storage-service. Copy `storage_service` and run it with
-# `python -m storage_service.main`. No EXPOSE: nothing connects to a consumer.
+FROM base AS storage-service
+COPY storage_service storage_service
+CMD ["python", "-m", "storage_service.main"]
 
-# TODO: analytics-service.
+FROM base AS analytics-service
+COPY analytics_service analytics_service
+CMD ["python", "-m", "analytics_service.main"]
 
-# TODO: report-service.
+FROM base AS report-service
+COPY report_service report_service
+CMD ["python", "-m", "report_service.main"]

@@ -1,4 +1,36 @@
-# ConfigMaps. Put the shared, non-secret environment of the four services here:
-# hosts, ports, S3 endpoint and region, LOG_LEVEL. Put garage.toml here too.
-#
-# Empty on purpose.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-config
+  namespace: aic
+data:
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_PORT: "5672"
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  S3_ENDPOINT: http://garage:3900
+  S3_REGION: garage
+  LOG_LEVEL: INFO
+---
+# Same content as s3/garage.toml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: garage-config
+  namespace: aic
+data:
+  garage.toml: |
+    metadata_dir = "/var/lib/garage/meta"
+    data_dir = "/var/lib/garage/data"
+    db_engine = "sqlite"
+    replication_factor = 1
+
+    rpc_bind_addr = "0.0.0.0:3901"
+    rpc_public_addr = "127.0.0.1:3901"
+
+    [s3_api]
+    s3_region = "garage"
+    api_bind_addr = "0.0.0.0:3900"
+
+    [admin]
+    api_bind_addr = "0.0.0.0:3903"
