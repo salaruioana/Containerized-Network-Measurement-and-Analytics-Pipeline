@@ -18,19 +18,21 @@ import logging
 import os
 import time
 
-import boto3
 import pika
 import redis
-
 
 from aic_common.contract import (
     AnalyticsResult,
     Buckets,
     JOB_PREFIX,
     JobStatus,
-    MEASUREMENT_PREFIX,
     Queues,
-    REPORT_PREFIX,
+)
+from aic_common.s3 import (
+    get_s3_client,
+    put_json,
+    report_id_for,
+    report_key,
 )
 
 SERVICE_NAME = "report-service"
@@ -40,19 +42,6 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(SERVICE_NAME)
-
-def report_id_for(measurement_id: str) -> str:
-    if not isinstance(measurement_id, str):
-        raise ValueError("Invalid measurement_id")
-
-    if not measurement_id.startswith(MEASUREMENT_PREFIX):
-        raise ValueError("Invalid measurement_id")
-    
-    suffix = measurement_id[len(MEASUREMENT_PREFIX):]
-    if not suffix:
-        raise ValueError("Invalid measurement_id")
-    
-    return f"{REPORT_PREFIX}{suffix}"
 
 def build_report(job_id: str, measurement_id: str, result: dict) -> dict:
     return {
@@ -78,16 +67,6 @@ def connect_redis() -> redis.Redis:
         except redis.RedisError:
             logger.warning("Redis unavailable. Retrying in 5 seconds...")
             time.sleep(5)
-
-def create_s3_client():
-    """Create an S3 client configured for Garage."""
-    return boto3.client(
-        "s3",
-        endpoint_url=os.environ["S3_ENDPOINT"],
-        region_name=os.getenv("S3_REGION", "garage"),
-        aws_access_key_id=os.environ["S3_ACCESS_KEY"],
-        aws_secret_access_key=os.environ["S3_SECRET_KEY"],
-    )
     
 class ReportStorageError(Exception):
     """Raised when a report cannot be stored in Garage."""
@@ -112,13 +91,13 @@ def process_message(payload: dict, redis_client: redis.Redis, s3_client) -> None
 
     report = build_report(job_id, measurement_id, result_dict)
 
-    # Store the report. Repeated messages overwrite the same object.
+    # Store the report using the shared S3 helper. Repeated messages overwrite the same object.
     try:
-        s3_client.put_object(
-            Bucket=Buckets.REPORTS,
-            Key=f"{report['report_id']}.json",
-            Body=json.dumps(report, ensure_ascii=False).encode("utf-8"),
-            ContentType="application/json",
+        put_json(
+            bucket=Buckets.REPORTS,
+            key=report_key(report["report_id"]),
+            data=report,
+            client=s3_client,
         )
         logger.info("Stored report %s", report["report_id"])
 
@@ -170,7 +149,7 @@ def connect_rabbitmq() -> pika.BlockingConnection:
 def main() -> None:
     """Connect to the broker and consume `Queues.ANALYSIS_COMPLETED` forever."""
     redis_client = connect_redis()
-    s3_client = create_s3_client()
+    s3_client = get_s3_client()
 
     while True:
         connection = None
