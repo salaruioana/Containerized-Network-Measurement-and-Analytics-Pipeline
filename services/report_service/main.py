@@ -42,6 +42,9 @@ logging.basicConfig(
 logger = logging.getLogger(SERVICE_NAME)
 
 def report_id_for(measurement_id: str) -> str:
+    if not isinstance(measurement_id, str):
+        raise ValueError("Invalid measurement_id")
+
     if not measurement_id.startswith(MEASUREMENT_PREFIX):
         raise ValueError("Invalid measurement_id")
     
@@ -86,28 +89,25 @@ def create_s3_client():
         aws_secret_access_key=os.environ["S3_SECRET_KEY"],
     )
     
-def process_message(
-    payload: dict,
-    redis_client: redis.Redis,
-    s3_client,
-) -> None:
+class ReportStorageError(Exception):
+    """Raised when a report cannot be stored in Garage."""
+    
+def process_message(payload: dict, redis_client: redis.Redis, s3_client) -> None:
     """Generate and store one report, then update its job in Redis."""
 
     job_id = payload["job_id"]
     measurement_id = payload["measurement_id"]
-
-    if not job_id.startswith(JOB_PREFIX) or job_id == JOB_PREFIX:
+    
+    if not isinstance(job_id, str) or not job_id.startswith(JOB_PREFIX) or job_id == JOB_PREFIX:
         raise ValueError("Invalid job_id")
 
     # The analysis result contains all message fields except job_id.
-    result_data = {
-        key: value
-        for key, value in payload.items()
-        if key != "job_id"
-    }
+    result_data = {key: value for key, value in payload.items() if key != "job_id"}
 
     # Validate the incoming analysis result against the shared contract.
     result = AnalyticsResult.model_validate(result_data)
+    if result.measurement_id != measurement_id:
+        raise ValueError("Inconsistent measurement_id in analysis result")
     result_dict = result.model_dump(exclude_none=True)
 
     report = build_report(job_id, measurement_id, result_dict)
@@ -116,23 +116,19 @@ def process_message(
     try:
         s3_client.put_object(
             Bucket=Buckets.REPORTS,
-            Key=report["report_id"],
+            Key=f"{report['report_id']}.json",
             Body=json.dumps(report, ensure_ascii=False).encode("utf-8"),
             ContentType="application/json",
         )
         logger.info("Stored report %s", report["report_id"])
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Could not store report %s", report["report_id"])
 
-        # Report storage failed: update the job status.
-        redis_client.hset(
-            f"job:{job_id}",
-            mapping={
-                "status": JobStatus.FAILED_REPORT_STORAGE.value,
-            },
-        )
-        raise
+        # Record the failure in Redis before acknowledging the message.
+        redis_client.hset(f"job:{job_id}", mapping={"status": JobStatus.FAILED_REPORT_STORAGE.value})
+
+        raise ReportStorageError(f"Could not store report {report['report_id']}") from exc
 
     # Update only the fields owned by Report Service.
     redis_client.hset(
@@ -173,7 +169,70 @@ def connect_rabbitmq() -> pika.BlockingConnection:
 
 def main() -> None:
     """Connect to the broker and consume `Queues.ANALYSIS_COMPLETED` forever."""
-    raise NotImplementedError("report_service.main")
+    redis_client = connect_redis()
+    s3_client = create_s3_client()
+
+    while True:
+        connection = None
+
+        try:
+            connection = connect_rabbitmq()
+            channel = connection.channel()
+
+            # The consumer declares the queue as durable.
+            channel.queue_declare(
+                queue=Queues.ANALYSIS_COMPLETED,
+                durable=True,
+            )
+
+            channel.basic_qos(prefetch_count=1)
+
+            def callback(ch, method, properties, body):
+                try:
+                    payload = json.loads(body)
+
+                    if not isinstance(payload, dict):
+                        raise ValueError("Message payload must be a JSON object")
+
+                    process_message(payload, redis_client, s3_client)
+
+                except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+                    logger.error("Invalid analysis.completed message: %s", exc)
+                    ch.basic_nack(
+                        delivery_tag=method.delivery_tag,
+                        requeue=False,
+                    )
+
+                except ReportStorageError:
+                    # The failure status was successfully saved in Redis.
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+
+                except Exception:
+                    logger.exception("Report processing failed")
+                    ch.basic_nack(
+                        delivery_tag=method.delivery_tag,
+                        requeue=True,
+                    )
+
+                else:
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+
+            channel.basic_consume(
+                queue=Queues.ANALYSIS_COMPLETED,
+                on_message_callback=callback,
+                auto_ack=False,
+            )
+
+            logger.info("Waiting for analysis.completed messages")
+            channel.start_consuming()
+
+        except (pika.exceptions.AMQPError, OSError):
+            logger.exception("RabbitMQ connection lost. Reconnecting...")
+            time.sleep(5)
+
+        finally:
+            if connection is not None and connection.is_open:
+                connection.close()
 
 
 if __name__ == "__main__":
