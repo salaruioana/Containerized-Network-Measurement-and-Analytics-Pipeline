@@ -1,6 +1,7 @@
-"""Unit tests for Measurement Storage Service (task #18).
+"""Unit tests for Measurement Storage Service (tasks #18 and #19).
 
-Tests message parsing, validation, manual ACK/NACK handling, and graceful shutdown.
+Tests message parsing, validation, raw measurement Garage persistence,
+manual ACK/NACK handling, idempotency, and graceful shutdown.
 """
 
 from __future__ import annotations
@@ -8,16 +9,41 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock
 
+import boto3
 import pytest
+from moto import mock_aws
 
-from aic_common.contract import Queues
+from aic_common.contract import Buckets, Queues
+from aic_common.s3 import exists, get_json
 from storage_service.main import (
     ConsumerContext,
     StorageMessage,
+    build_raw_measurement_document,
     handle_message,
     parse_storage_message,
     process_message,
+    store_raw_measurement,
 )
+
+
+@pytest.fixture(autouse=True)
+def clean_aws_env(monkeypatch):
+    """Ensure AWS credentials and proxy don't interfere with tests."""
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_SECURITY_TOKEN", "testing")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+
+
+@pytest.fixture
+def mock_s3():
+    with mock_aws():
+        client = boto3.client("s3", region_name="us-east-1")
+        client.create_bucket(Bucket=Buckets.MEASUREMENTS)
+        yield client
 
 
 @pytest.fixture
@@ -139,33 +165,116 @@ def test_non_dict_non_json_rejected():
         parse_storage_message(12345)
 
 
-def test_handle_message_ack_on_success(valid_flat_payload):
+# --- Task #19: Raw measurement persistence tests ---
+
+
+def test_build_raw_measurement_document_with_packets(valid_flat_payload):
+    msg = parse_storage_message(valid_flat_payload)
+    doc = build_raw_measurement_document(msg)
+
+    assert doc == {
+        "measurement_id": "m-001",
+        "source_host": "h1",
+        "target_host": "h2",
+        "metric": "latency",
+        "values_ms": [10.5, 11.2, 9.8, 45.0],
+        "unit": "ms",
+        "timestamp": "2026-06-22T10:00:00Z",
+        "packets_sent": 5,
+        "packets_received": 5,
+    }
+
+
+def test_build_raw_measurement_document_without_packets():
+    payload = {
+        "job_id": "job-005",
+        "measurement_id": "m-005",
+        "source_host": "h1",
+        "target_host": "h2",
+        "metric": "latency",
+        "values_ms": [10.0],
+        "timestamp": "2026-06-22T10:00:00Z",
+    }
+    msg = parse_storage_message(payload)
+    doc = build_raw_measurement_document(msg)
+
+    assert "packets_sent" not in doc
+    assert "packets_received" not in doc
+    assert doc["measurement_id"] == "m-005"
+
+
+def test_store_raw_measurement_success(mock_s3, valid_flat_payload):
+    msg = parse_storage_message(valid_flat_payload)
+    key = store_raw_measurement(msg, s3_client=mock_s3)
+
+    assert key == "h1-h2/m-001.json"
+    assert exists(Buckets.MEASUREMENTS, key, client=mock_s3) is True
+
+    stored = get_json(Buckets.MEASUREMENTS, key, client=mock_s3)
+    assert stored["measurement_id"] == "m-001"
+    assert stored["source_host"] == "h1"
+    assert stored["target_host"] == "h2"
+    assert stored["metric"] == "latency"
+    assert stored["values_ms"] == [10.5, 11.2, 9.8, 45.0]
+    assert stored["packets_sent"] == 5
+    assert stored["packets_received"] == 5
+
+
+def test_store_raw_measurement_idempotent_redelivery(mock_s3, valid_flat_payload):
+    msg = parse_storage_message(valid_flat_payload)
+
+    # First write
+    key1 = store_raw_measurement(msg, s3_client=mock_s3)
+    # Second write (simulated redelivery)
+    key2 = store_raw_measurement(msg, s3_client=mock_s3)
+
+    assert key1 == key2 == "h1-h2/m-001.json"
+
+    # Verify bucket has only 1 object
+    response = mock_s3.list_objects_v2(Bucket=Buckets.MEASUREMENTS)
+    assert response["KeyCount"] == 1
+    assert response["Contents"][0]["Key"] == "h1-h2/m-001.json"
+
+
+def test_process_message_stores_raw_measurement(mock_s3, valid_flat_payload):
+    msg = parse_storage_message(valid_flat_payload)
+    process_message(msg, s3_client=mock_s3)
+
+    expected_key = "h1-h2/m-001.json"
+    assert exists(Buckets.MEASUREMENTS, expected_key, client=mock_s3) is True
+
+
+# --- Consumer callback & lifecycle tests ---
+
+
+def test_handle_message_ack_on_success(mock_s3, valid_flat_payload):
     channel = MagicMock()
     method = MagicMock()
     method.delivery_tag = 42
     properties = MagicMock()
     body = json.dumps(valid_flat_payload).encode("utf-8")
 
-    handle_message(channel, method, properties, body)
+    handle_message(channel, method, properties, body, s3_client=mock_s3)
 
     channel.basic_ack.assert_called_once_with(delivery_tag=42)
     channel.basic_nack.assert_not_called()
+    assert exists(Buckets.MEASUREMENTS, "h1-h2/m-001.json", client=mock_s3) is True
 
 
-def test_handle_message_nack_no_requeue_on_malformed_json():
+def test_handle_message_nack_no_requeue_on_malformed_json(mock_s3):
     channel = MagicMock()
     method = MagicMock()
     method.delivery_tag = 99
     properties = MagicMock()
     body = b"not a json object {"
 
-    handle_message(channel, method, properties, body)
+    handle_message(channel, method, properties, body, s3_client=mock_s3)
 
     channel.basic_nack.assert_called_once_with(delivery_tag=99, requeue=False)
     channel.basic_ack.assert_not_called()
 
 
-def test_handle_message_nack_no_requeue_on_schema_violation(valid_flat_payload):
+def test_handle_message_nack_no_requeue_on_schema_violation(mock_s3, valid_flat_payload):
     valid_flat_payload["job_id"] = "bad-prefix"
     channel = MagicMock()
     method = MagicMock()
@@ -173,13 +282,13 @@ def test_handle_message_nack_no_requeue_on_schema_violation(valid_flat_payload):
     properties = MagicMock()
     body = json.dumps(valid_flat_payload).encode("utf-8")
 
-    handle_message(channel, method, properties, body)
+    handle_message(channel, method, properties, body, s3_client=mock_s3)
 
     channel.basic_nack.assert_called_once_with(delivery_tag=100, requeue=False)
     channel.basic_ack.assert_not_called()
 
 
-def test_handle_message_nack_requeue_on_unexpected_error(monkeypatch, valid_flat_payload):
+def test_handle_message_nack_requeue_on_unexpected_error(monkeypatch, mock_s3, valid_flat_payload):
     channel = MagicMock()
     method = MagicMock()
     method.delivery_tag = 101
@@ -191,7 +300,7 @@ def test_handle_message_nack_requeue_on_unexpected_error(monkeypatch, valid_flat
 
     monkeypatch.setattr("storage_service.main.process_message", raise_crash)
 
-    handle_message(channel, method, properties, body)
+    handle_message(channel, method, properties, body, s3_client=mock_s3)
 
     channel.basic_nack.assert_called_once_with(delivery_tag=101, requeue=True)
     channel.basic_ack.assert_not_called()
@@ -207,4 +316,3 @@ def test_consumer_context_stop():
     context.request_stop()
     assert context.stop_requested is True
     mock_channel.stop_consuming.assert_called_once()
-

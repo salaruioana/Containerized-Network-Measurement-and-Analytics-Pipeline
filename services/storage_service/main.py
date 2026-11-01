@@ -27,9 +27,16 @@ import pika.exceptions
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from aic_common.contract import (
+    Buckets,
     JOB_PREFIX,
     MEASUREMENT_PREFIX,
     Queues,
+)
+from aic_common.s3 import (
+    get_s3_client,
+    measurement_key,
+    measurement_object_path,
+    put_json,
 )
 
 SERVICE_NAME = "storage-service"
@@ -141,6 +148,47 @@ def parse_storage_message(raw_payload: str | bytes | dict[str, Any]) -> StorageM
     return StorageMessage.model_validate(data)
 
 
+def build_raw_measurement_document(msg: StorageMessage) -> dict[str, Any]:
+    """Construct the raw measurement JSON document to be stored in Garage."""
+    doc: dict[str, Any] = {
+        "measurement_id": msg.measurement_id,
+        "source_host": msg.source_host,
+        "target_host": msg.target_host,
+        "metric": msg.metric,
+        "values_ms": msg.values_ms,
+        "unit": msg.unit,
+        "timestamp": msg.timestamp,
+    }
+    if msg.packets_sent is not None:
+        doc["packets_sent"] = msg.packets_sent
+    if msg.packets_received is not None:
+        doc["packets_received"] = msg.packets_received
+    return doc
+
+
+def store_raw_measurement(msg: StorageMessage, s3_client: Any = None) -> str:
+    """Store the raw measurement JSON in the measurements bucket.
+    
+    The object key is deterministic: '{source_host}-{target_host}/{measurement_id}.json'.
+    Redeliveries safely overwrite the same key without producing duplicate objects.
+    Returns the deterministic S3 key.
+    """
+    if s3_client is None:
+        s3_client = get_s3_client()
+
+    key = measurement_key(msg.source_host, msg.target_host, msg.measurement_id)
+    doc = build_raw_measurement_document(msg)
+    put_json(bucket=Buckets.MEASUREMENTS, key=key, data=doc, client=s3_client)
+    logger.info(
+        "Stored raw measurement %s at %s/%s (job %s)",
+        msg.measurement_id,
+        Buckets.MEASUREMENTS,
+        key,
+        msg.job_id,
+    )
+    return key
+
+
 def process_message(
     msg: StorageMessage,
     s3_client: Any = None,
@@ -148,10 +196,12 @@ def process_message(
 ) -> None:
     """Process a single storage job.
     
-    Logs the job_id and measurement_id as required by task #18.
-    Follow-up storage write and workflow operations (tasks #19-#22) hook in here.
+    1. Write the raw measurement to Garage S3 before metadata/job status (Task #19).
+    2. Write measurement metadata to Redis (Task #20).
+    3. Update job status in Redis (Tasks #21 / #22).
     """
     logger.info("Consumed storage job %s for measurement %s", msg.job_id, msg.measurement_id)
+    store_raw_measurement(msg, s3_client=s3_client)
 
 
 def handle_message(
@@ -253,6 +303,7 @@ def main() -> None:
             logger.debug("Could not register signal %s: %s", sig, exc)
 
     logger.info("Starting %s...", SERVICE_NAME)
+    s3_client = get_s3_client()
 
     while not context.stop_requested:
         try:
@@ -271,7 +322,7 @@ def main() -> None:
             channel.basic_qos(prefetch_count=1)
 
             def callback(ch, method, properties, body):
-                handle_message(ch, method, properties, body)
+                handle_message(ch, method, properties, body, s3_client=s3_client)
 
             channel.basic_consume(
                 queue=Queues.MEASUREMENT_CREATED,
