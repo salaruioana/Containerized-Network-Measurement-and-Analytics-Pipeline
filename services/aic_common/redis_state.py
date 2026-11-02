@@ -14,9 +14,54 @@ from aic_common.contract import (
     JobStatus,
 )
 
+ALLOWED_TRANSITIONS = {
+    JobStatus.STORED: {
+        JobStatus.QUEUED,
+    },
+    JobStatus.ANALYZED: {
+        JobStatus.STORED,
+    },
+    JobStatus.COMPLETED: {
+        JobStatus.STORED,    # Workflow A
+        JobStatus.ANALYZED,  # Workflow B
+    },
+    JobStatus.FAILED_MEASUREMENT_STORAGE: {
+        JobStatus.QUEUED,
+    },
+    JobStatus.FAILED_ANALYSIS: {
+        JobStatus.STORED,
+    },
+    JobStatus.FAILED_REPORT_STORAGE: {
+        JobStatus.ANALYZED,
+    },
+}
+
+_TRANSITION_SCRIPT = """
+local current = redis.call("HGET", KEYS[1], "status")
+
+if not current then
+    return -1
+end
+
+if current == ARGV[1] then
+    return 0
+end
+
+for i = 2, #ARGV do
+    if current == ARGV[i] then
+        redis.call("HSET", KEYS[1], "status", ARGV[1])
+        return 1
+    end
+end
+
+return -2
+"""
 
 class RedisStateError(Exception):
     """Raised when a Redis state operation fails."""
+
+class InvalidJobTransition(Exception):
+    """Raised when a job status transition is not allowed."""
 
 
 def get_redis_client() -> redis.Redis:
@@ -74,22 +119,41 @@ def create_job(
     except redis.RedisError as exc:
         raise RedisStateError(f"Could not create job {job_id}") from exc
 
+def set_job_status(client, job_id, new_status: JobStatus) -> bool:
+    """Transition a job to a new status if the transition is allowed.
 
-def set_job_status(
-    client: redis.Redis,
-    job_id: str,
-    status: JobStatus,
-) -> None:
-    """Update only the status field of a job."""
-    if not isinstance(status, JobStatus):
-        raise ValueError("status must be a JobStatus value")
+    Returns True if the status changed, False if it was already set.
+    Raises InvalidJobTransition for invalid transitions.
+    """
+    if not isinstance(new_status, JobStatus):
+        raise ValueError("new_status must be a JobStatus value")
 
-    set_job_fields(
-        client,
-        job_id,
-        {"status": status.value},
-    )
+    key = _job_key(job_id)
+    allowed_previous = ALLOWED_TRANSITIONS[new_status]
 
+    try:
+        result = client.eval(
+            _TRANSITION_SCRIPT,
+            1,
+            key,
+            new_status.value,
+            *[status.value for status in allowed_previous],
+        )
+    except redis.RedisError as exc:
+        raise RedisStateError(
+            f"Could not update status for job {job_id}"
+        ) from exc
+
+    if result == -1:
+        raise RedisStateError(f"Job {job_id} does not exist or has no status")
+
+    if result == -2:
+        raise InvalidJobTransition(
+            f"Cannot transition job {job_id} to {new_status.value}"
+        )
+
+    # True = changed; False = already in the requested state.
+    return result == 1
 
 def set_job_fields(
     client: redis.Redis,
@@ -101,6 +165,11 @@ def set_job_fields(
 
     if not fields:
         raise ValueError("At least one job field must be provided")
+    
+    if "status" in fields:
+        raise ValueError(
+            "Use set_job_status() to update the job status"
+        )
 
     try:
         client.hset(key, mapping=dict(fields))
