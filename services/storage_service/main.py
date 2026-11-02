@@ -218,6 +218,11 @@ def store_measurement_metadata(msg: StorageMessage, redis_client: Any) -> dict[s
     return metadata
 
 
+class StorageWriteError(Exception):
+    """Raised when writing raw measurement to S3 or metadata to Redis fails."""
+    pass
+
+
 def complete_job_workflow_a(job_id: str, redis_client: Any) -> None:
     """Mark job as completed in Redis for Workflow A (store-only).
     
@@ -226,6 +231,58 @@ def complete_job_workflow_a(job_id: str, redis_client: Any) -> None:
     """
     redis_client.hset(name=f"job:{job_id}", key="status", value=JobStatus.COMPLETED.value)
     logger.info("Marked job %s as %s", job_id, JobStatus.COMPLETED.value)
+
+
+def handle_storage_failure(
+    job_id: str,
+    exc: Exception,
+    redis_client: Any = None,
+    channel: Any = None,
+    measurement_id: str | None = None,
+) -> None:
+    """Handle S3 or Redis storage write failure.
+    
+    Per CONTRACT.md §2.2, §6 and Task #23:
+    1. Sets job status in Redis to failed_measurement_storage (single-field update).
+    2. Logs an error line explicitly naming the job_id.
+    3. Optionally publishes to Queues.MEASUREMENT_FAILED.
+    """
+    logger.error("Failed measurement storage for job %s: %s", job_id, exc)
+    if redis_client is not None:
+        try:
+            redis_client.hset(
+                name=f"job:{job_id}",
+                key="status",
+                value=JobStatus.FAILED_MEASUREMENT_STORAGE.value,
+            )
+            logger.info(
+                "Marked job %s as %s", job_id, JobStatus.FAILED_MEASUREMENT_STORAGE.value
+            )
+        except Exception as redis_exc:
+            logger.error(
+                "Could not update failure status in Redis for job %s: %s", job_id, redis_exc
+            )
+
+    if channel is not None:
+        try:
+            channel.queue_declare(queue=Queues.MEASUREMENT_FAILED, durable=True)
+            err_payload = {
+                "job_id": job_id,
+                "measurement_id": measurement_id or "",
+                "status": JobStatus.FAILED_MEASUREMENT_STORAGE.value,
+                "error": str(exc),
+            }
+            channel.basic_publish(
+                exchange="",
+                routing_key=Queues.MEASUREMENT_FAILED,
+                body=json.dumps(err_payload).encode("utf-8"),
+                properties=pika.BasicProperties(
+                    delivery_mode=pika.DeliveryMode.Persistent,
+                    content_type="application/json",
+                ),
+            )
+        except Exception as pub_exc:
+            logger.debug("Optional publish to %s failed: %s", Queues.MEASUREMENT_FAILED, pub_exc)
 
 
 def request_analysis_workflow_b(
@@ -282,12 +339,25 @@ def process_message(
     
     1. Write the raw measurement to Garage S3 before metadata/job status (Task #19).
     2. Write measurement metadata to Redis (Task #20).
-    3. Update job status in Redis & optionally forward to analytics (Tasks #21 / #22).
+    3. On storage write failure: set status=failed_measurement_storage and log job_id (Task #23).
+    4. Update job status in Redis & optionally forward to analytics (Tasks #21 / #22).
     """
     logger.info("Consumed storage job %s for measurement %s", msg.job_id, msg.measurement_id)
-    store_raw_measurement(msg, s3_client=s3_client)
+    try:
+        store_raw_measurement(msg, s3_client=s3_client)
+        if redis_client is not None:
+            store_measurement_metadata(msg, redis_client=redis_client)
+    except Exception as exc:
+        handle_storage_failure(
+            job_id=msg.job_id,
+            exc=exc,
+            redis_client=redis_client,
+            channel=channel,
+            measurement_id=msg.measurement_id,
+        )
+        raise StorageWriteError(f"Storage write failed for job {msg.job_id}") from exc
+
     if redis_client is not None:
-        store_measurement_metadata(msg, redis_client=redis_client)
         if not msg.analyze:
             complete_job_workflow_a(msg.job_id, redis_client=redis_client)
         else:
@@ -305,7 +375,6 @@ def handle_message(
     """Callback handler for measurement.created messages with manual ACK/NACK."""
     try:
         msg = parse_storage_message(body)
-        process_message(msg, s3_client=s3_client, redis_client=redis_client, channel=ch)
     except (json.JSONDecodeError, ValueError, TypeError) as exc:
         logger.error(
             "Rejected malformed message on %s (requeue=False): %s | Raw body: %s",
@@ -314,6 +383,13 @@ def handle_message(
             body[:200] if isinstance(body, (bytes, str)) else body,
         )
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+        return
+
+    try:
+        process_message(msg, s3_client=s3_client, redis_client=redis_client, channel=ch)
+    except StorageWriteError as exc:
+        logger.error("Job %s terminated with failure during storage: %s", msg.job_id, exc)
+        ch.basic_ack(delivery_tag=method.delivery_tag)
         return
     except Exception as exc:
         logger.exception("Unexpected error processing storage message: %s", exc)
@@ -441,6 +517,10 @@ def main() -> None:
             )
             channel.queue_declare(
                 queue=Queues.ANALYSIS_REQUESTED,
+                durable=True,
+            )
+            channel.queue_declare(
+                queue=Queues.MEASUREMENT_FAILED,
                 durable=True,
             )
 

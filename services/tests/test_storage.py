@@ -19,9 +19,11 @@ from aic_common.s3 import exists, get_json
 from storage_service.main import (
     ConsumerContext,
     StorageMessage,
+    StorageWriteError,
     build_raw_measurement_document,
     complete_job_workflow_a,
     handle_message,
+    handle_storage_failure,
     parse_storage_message,
     process_message,
     request_analysis_workflow_b,
@@ -616,6 +618,141 @@ def test_workflow_b_idempotent_redelivery(mock_s3, fake_redis, valid_flat_payloa
     assert fake_redis.hgetall("job:job-002")["status"] == JobStatus.STORED.value
     # Channel was published to twice
     assert mock_channel.basic_publish.call_count == 2
+
+
+# --- Task #23: Storage failure handling (failed_measurement_storage) tests ---
+
+
+def test_handle_storage_failure_sets_status_and_logs(fake_redis, caplog):
+    fake_redis.hset(
+        "job:job-001",
+        mapping={"measurement_id": "m-001", "status": JobStatus.QUEUED.value},
+    )
+
+    with caplog.at_level("INFO"):
+        handle_storage_failure(
+            job_id="job-001",
+            exc=RuntimeError("S3 connection reset"),
+            redis_client=fake_redis,
+        )
+
+    # 1. Status updated to failed_measurement_storage in Redis
+    job = fake_redis.hgetall("job:job-001")
+    assert job["status"] == JobStatus.FAILED_MEASUREMENT_STORAGE.value
+    assert job["measurement_id"] == "m-001"
+
+    # 2. Log line explicitly names the job_id
+    assert "job-001" in caplog.text
+    assert "Failed measurement storage" in caplog.text
+
+
+def test_handle_storage_failure_publishes_to_measurement_failed(fake_redis):
+    fake_redis.hset(
+        "job:job-001",
+        mapping={"measurement_id": "m-001", "status": JobStatus.QUEUED.value},
+    )
+    mock_channel = MagicMock()
+
+    handle_storage_failure(
+        job_id="job-001",
+        exc=RuntimeError("Garage stopped"),
+        redis_client=fake_redis,
+        channel=mock_channel,
+        measurement_id="m-001",
+    )
+
+    # Verifies optional publish to Queues.MEASUREMENT_FAILED
+    mock_channel.queue_declare.assert_called_with(
+        queue=Queues.MEASUREMENT_FAILED, durable=True
+    )
+    mock_channel.basic_publish.assert_called_once()
+    _, kwargs = mock_channel.basic_publish.call_args
+    assert kwargs["routing_key"] == Queues.MEASUREMENT_FAILED
+    err_payload = json.loads(kwargs["body"].decode("utf-8"))
+    assert err_payload["job_id"] == "job-001"
+    assert err_payload["measurement_id"] == "m-001"
+    assert err_payload["status"] == JobStatus.FAILED_MEASUREMENT_STORAGE.value
+    assert "Garage stopped" in err_payload["error"]
+
+
+def test_process_message_s3_failure_marks_job_failed(fake_redis, valid_flat_payload, caplog):
+    fake_redis.hset(
+        "job:job-001",
+        mapping={"measurement_id": "m-001", "status": JobStatus.QUEUED.value},
+    )
+    msg = parse_storage_message(valid_flat_payload)
+
+    mock_s3 = MagicMock()
+    mock_s3.put_object.side_effect = RuntimeError("Garage unreachable: Connection refused")
+
+    with caplog.at_level("INFO"):
+        with pytest.raises(StorageWriteError, match="Storage write failed for job job-001"):
+            process_message(msg, s3_client=mock_s3, redis_client=fake_redis)
+
+    # 1. Job ended in failed_measurement_storage in Redis
+    job = fake_redis.hgetall("job:job-001")
+    assert job["status"] == JobStatus.FAILED_MEASUREMENT_STORAGE.value
+
+    # 2. Log shows the job_id
+    assert "job-001" in caplog.text
+    assert "Failed measurement storage for job job-001" in caplog.text
+
+
+def test_handle_message_s3_failure_acks_and_marks_failed(fake_redis, valid_flat_payload, caplog):
+    fake_redis.hset(
+        "job:job-001",
+        mapping={"measurement_id": "m-001", "status": JobStatus.QUEUED.value},
+    )
+
+    mock_s3 = MagicMock()
+    mock_s3.put_object.side_effect = RuntimeError("Garage down")
+
+    channel = MagicMock()
+    method = MagicMock()
+    method.delivery_tag = 123
+    properties = MagicMock()
+    body = json.dumps(valid_flat_payload).encode("utf-8")
+
+    with caplog.at_level("INFO"):
+        handle_message(
+            channel,
+            method,
+            properties,
+            body,
+            s3_client=mock_s3,
+            redis_client=fake_redis,
+        )
+
+    # Acknowledges delivery because job reached terminal failure state (prevents infinite requeue)
+    channel.basic_ack.assert_called_once_with(delivery_tag=123)
+    channel.basic_nack.assert_not_called()
+
+    # Redis job is marked failed_measurement_storage
+    assert fake_redis.hgetall("job:job-001")["status"] == JobStatus.FAILED_MEASUREMENT_STORAGE.value
+    # Log line names the job_id
+    assert "job-001" in caplog.text
+
+
+def test_process_message_redis_metadata_failure_marks_job_failed(mock_s3, valid_flat_payload):
+    msg = parse_storage_message(valid_flat_payload)
+
+    class FailingMetadataRedis(FakeRedis):
+        def hset(self, name: str, key: str | None = None, value: Any = None, mapping: dict | None = None, **kwargs) -> int:
+            if name.startswith("meas:"):
+                raise RuntimeError("Redis disk full during metadata write")
+            return super().hset(name, key=key, value=value, mapping=mapping, **kwargs)
+
+    redis_client = FailingMetadataRedis()
+    redis_client.hset(
+        "job:job-001",
+        mapping={"measurement_id": "m-001", "status": JobStatus.QUEUED.value},
+    )
+
+    with pytest.raises(StorageWriteError):
+        process_message(msg, s3_client=mock_s3, redis_client=redis_client)
+
+    # Status must be set to failed_measurement_storage
+    assert redis_client.hgetall("job:job-001")["status"] == JobStatus.FAILED_MEASUREMENT_STORAGE.value
 
 
 # --- Consumer callback & lifecycle tests ---
