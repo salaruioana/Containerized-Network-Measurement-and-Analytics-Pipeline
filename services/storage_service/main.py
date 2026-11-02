@@ -64,7 +64,7 @@ class StorageMessage(BaseModel):
     source_host: str
     target_host: str
     metric: str
-    values_ms: list[float]
+    values_ms: list[int | float]
     unit: str | None = None
     timestamp: str | None = None
     packets_sent: int | None = None
@@ -111,16 +111,16 @@ class StorageMessage(BaseModel):
 
     @field_validator("values_ms", mode="before")
     @classmethod
-    def validate_values(cls, v: Any) -> list[float]:
+    def validate_values(cls, v: Any) -> list[int | float]:
         if not isinstance(v, list) or len(v) == 0:
             raise ValueError("Measurement must contain at least 1 sample in values_ms")
-        validated: list[float] = []
+        validated: list[int | float] = []
         for sample in v:
             if isinstance(sample, bool) or not isinstance(sample, (int, float)):
                 raise ValueError("values_ms samples must be numbers")
             if not math.isfinite(sample) or sample < 0:
                 raise ValueError("values_ms samples must be finite and non-negative")
-            validated.append(float(sample))
+            validated.append(int(sample) if isinstance(sample, int) and not isinstance(sample, bool) else float(sample))
         return validated
 
     @field_validator("unit", "analysis", mode="before")
@@ -173,7 +173,9 @@ class StorageMessage(BaseModel):
 
         # Set arrival timestamp if missing per contract §2.1
         if not data.get("timestamp"):
-            data["timestamp"] = datetime.now(timezone.utc).isoformat()
+            data["timestamp"] = (
+                datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+            )
 
         # If analysis name provided but analyze flag is false/unset, set analyze=True
         if data.get("analysis") and not data.get("analyze"):

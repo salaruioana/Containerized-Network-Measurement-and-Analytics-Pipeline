@@ -195,25 +195,26 @@ class RabbitMQPublisher:
             self._declared_queues.add(queue)
 
         if hasattr(payload, "model_dump"):
-            body = json.dumps(
-                payload.model_dump(exclude_none=True),
-                ensure_ascii=False,
-                allow_nan=False,
-            ).encode("utf-8")
+            try:
+                dumped = payload.model_dump(mode="json", exclude_none=True)
+            except (TypeError, ValueError):
+                dumped = payload.model_dump(exclude_none=True)
+            body = json.dumps(dumped, ensure_ascii=False, allow_nan=False).encode("utf-8")
         elif hasattr(payload, "dict"):
             body = json.dumps(
                 payload.dict(exclude_none=True),
                 ensure_ascii=False,
                 allow_nan=False,
+                default=str,
             ).encode("utf-8")
         elif isinstance(payload, (dict, list)):
-            body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            body = json.dumps(payload, ensure_ascii=False, allow_nan=False, default=str).encode("utf-8")
         elif isinstance(payload, str):
             body = payload.encode("utf-8")
         elif isinstance(payload, bytes):
             body = payload
         else:
-            body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            body = json.dumps(payload, ensure_ascii=False, allow_nan=False, default=str).encode("utf-8")
 
         properties = pika.BasicProperties(
             content_type="application/json",
@@ -312,7 +313,17 @@ class RabbitMQConsumer:
     def request_stop(self) -> None:
         """Request the consumer to stop gracefully."""
         self.stop_requested = True
-        if self.channel and self.channel.is_open:
+        if self.connection and getattr(self.connection, "is_open", False):
+            try:
+                if self.channel and getattr(self.channel, "is_open", False):
+                    self.connection.add_callback_threadsafe(self.channel.stop_consuming)
+            except Exception:
+                try:
+                    if self.channel and self.channel.is_open:
+                        self.channel.stop_consuming()
+                except Exception:
+                    pass
+        elif self.channel and getattr(self.channel, "is_open", False):
             try:
                 self.channel.stop_consuming()
             except Exception:

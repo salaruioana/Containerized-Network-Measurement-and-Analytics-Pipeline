@@ -85,19 +85,20 @@ def put_json(
         client = get_s3_client()
 
     if hasattr(data, "model_dump"):
-        payload = json.dumps(
-            data.model_dump(exclude_none=True),
-            ensure_ascii=False,
-            allow_nan=False,
-        )
+        try:
+            dumped = data.model_dump(mode="json", exclude_none=True)
+        except (TypeError, ValueError):
+            dumped = data.model_dump(exclude_none=True)
+        payload = json.dumps(dumped, ensure_ascii=False, allow_nan=False)
     elif hasattr(data, "dict"):
         payload = json.dumps(
             data.dict(exclude_none=True),
             ensure_ascii=False,
             allow_nan=False,
+            default=str,
         )
     else:
-        payload = json.dumps(data, ensure_ascii=False, allow_nan=False)
+        payload = json.dumps(data, ensure_ascii=False, allow_nan=False, default=str)
 
     client.put_object(
         Bucket=bucket,
