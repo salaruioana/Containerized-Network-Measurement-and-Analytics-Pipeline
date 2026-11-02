@@ -10,6 +10,7 @@ import json
 from unittest.mock import MagicMock
 
 import boto3
+import pika
 import pytest
 from moto import mock_aws
 
@@ -23,6 +24,7 @@ from storage_service.main import (
     handle_message,
     parse_storage_message,
     process_message,
+    request_analysis_workflow_b,
     store_measurement_metadata,
     store_raw_measurement,
 )
@@ -438,6 +440,182 @@ def test_handle_message_workflow_a_completes_job_and_acks(
     channel.basic_ack.assert_called_once_with(delivery_tag=77)
     channel.basic_nack.assert_not_called()
     assert fake_redis.hgetall("job:job-001")["status"] == JobStatus.COMPLETED.value
+
+
+# --- Task #22: Workflow B: mark the job stored and request analysis tests ---
+
+
+def test_request_analysis_workflow_b_sets_stored_and_publishes(fake_redis):
+    fake_redis.hset(
+        "job:job-002",
+        mapping={"measurement_id": "m-002", "status": JobStatus.QUEUED.value},
+    )
+    payload = {
+        "job_id": "job-002",
+        "measurement_id": "m-002",
+        "source_host": "h1",
+        "target_host": "h3",
+        "metric": "latency",
+        "values_ms": [10, 11, 9, 45, 12],
+        "analyze": True,
+        "analysis": "latency_summary",
+        "threshold_ms": 25,
+    }
+    msg = parse_storage_message(payload)
+    mock_channel = MagicMock()
+
+    analysis_payload = request_analysis_workflow_b(msg, fake_redis, channel=mock_channel)
+
+    # 1. Redis status updated to stored (single field, no overwrite)
+    job = fake_redis.hgetall("job:job-002")
+    assert job["status"] == JobStatus.STORED.value
+    assert job["measurement_id"] == "m-002"
+
+    # 2. Queue declared durable
+    mock_channel.queue_declare.assert_called_with(
+        queue=Queues.ANALYSIS_REQUESTED, durable=True
+    )
+
+    # 3. Message published to exactly one queue with delivery_mode=2
+    mock_channel.basic_publish.assert_called_once()
+    publish_args, publish_kwargs = mock_channel.basic_publish.call_args
+    assert publish_kwargs["exchange"] == ""
+    assert publish_kwargs["routing_key"] == Queues.ANALYSIS_REQUESTED
+    assert publish_kwargs["properties"].delivery_mode == 2
+    assert publish_kwargs["properties"].content_type == "application/json"
+
+    # 4. Message body matches {job_id, measurement_id, analysis, threshold_ms}
+    published_body = json.loads(publish_kwargs["body"].decode("utf-8"))
+    assert published_body == {
+        "job_id": "job-002",
+        "measurement_id": "m-002",
+        "analysis": "latency_summary",
+        "threshold_ms": 25,
+    }
+    assert analysis_payload == published_body
+
+
+def test_process_message_workflow_b_full_sequence(mock_s3, fake_redis, valid_flat_payload):
+    valid_flat_payload["job_id"] = "job-002"
+    valid_flat_payload["measurement_id"] = "m-002"
+    valid_flat_payload["analyze"] = True
+    valid_flat_payload["analysis"] = "latency_summary"
+    valid_flat_payload["threshold_ms"] = 35
+
+    fake_redis.hset(
+        "job:job-002",
+        mapping={"measurement_id": "m-002", "status": JobStatus.QUEUED.value},
+    )
+
+    msg = parse_storage_message(valid_flat_payload)
+    mock_channel = MagicMock()
+
+    process_message(msg, s3_client=mock_s3, redis_client=fake_redis, channel=mock_channel)
+
+    # 1. S3 raw measurement written
+    assert exists(Buckets.MEASUREMENTS, "h1-h2/m-002.json", client=mock_s3) is True
+    # 2. Redis metadata written
+    assert fake_redis.hgetall("meas:m-002")["status"] == "stored"
+    # 3. Redis job status set to stored
+    assert fake_redis.hgetall("job:job-002")["status"] == JobStatus.STORED.value
+    # 4. RabbitMQ published to measurement.analysis.requested
+    mock_channel.basic_publish.assert_called_once()
+    _, kwargs = mock_channel.basic_publish.call_args
+    assert kwargs["routing_key"] == Queues.ANALYSIS_REQUESTED
+
+
+def test_handle_message_workflow_b_ack_on_success(mock_s3, fake_redis, valid_flat_payload):
+    valid_flat_payload["job_id"] = "job-002"
+    valid_flat_payload["measurement_id"] = "m-002"
+    valid_flat_payload["analyze"] = True
+    valid_flat_payload["analysis"] = "latency_summary"
+
+    fake_redis.hset(
+        "job:job-002",
+        mapping={"measurement_id": "m-002", "status": JobStatus.QUEUED.value},
+    )
+
+    channel = MagicMock()
+    method = MagicMock()
+    method.delivery_tag = 88
+    properties = MagicMock()
+    body = json.dumps(valid_flat_payload).encode("utf-8")
+
+    handle_message(
+        channel,
+        method,
+        properties,
+        body,
+        s3_client=mock_s3,
+        redis_client=fake_redis,
+    )
+
+    channel.basic_ack.assert_called_once_with(delivery_tag=88)
+    channel.basic_nack.assert_not_called()
+    assert fake_redis.hgetall("job:job-002")["status"] == JobStatus.STORED.value
+    channel.basic_publish.assert_called_once()
+
+
+def test_workflow_b_publish_failure_triggers_nack_requeue(
+    mock_s3, fake_redis, valid_flat_payload
+):
+    valid_flat_payload["job_id"] = "job-002"
+    valid_flat_payload["measurement_id"] = "m-002"
+    valid_flat_payload["analyze"] = True
+    valid_flat_payload["analysis"] = "latency_summary"
+
+    fake_redis.hset(
+        "job:job-002",
+        mapping={"measurement_id": "m-002", "status": JobStatus.QUEUED.value},
+    )
+
+    channel = MagicMock()
+    channel.basic_publish.side_effect = pika.exceptions.AMQPError("Simulated broker disconnect")
+    method = MagicMock()
+    method.delivery_tag = 99
+    properties = MagicMock()
+    body = json.dumps(valid_flat_payload).encode("utf-8")
+
+    handle_message(
+        channel,
+        method,
+        properties,
+        body,
+        s3_client=mock_s3,
+        redis_client=fake_redis,
+    )
+
+    # Publish failure must NOT ack, must nack with requeue=True for at-least-once delivery
+    channel.basic_nack.assert_called_once_with(delivery_tag=99, requeue=True)
+    channel.basic_ack.assert_not_called()
+
+
+def test_workflow_b_idempotent_redelivery(mock_s3, fake_redis, valid_flat_payload):
+    valid_flat_payload["job_id"] = "job-002"
+    valid_flat_payload["measurement_id"] = "m-002"
+    valid_flat_payload["analyze"] = True
+    valid_flat_payload["analysis"] = "latency_summary"
+
+    fake_redis.hset(
+        "job:job-002",
+        mapping={"measurement_id": "m-002", "status": JobStatus.QUEUED.value},
+    )
+
+    msg = parse_storage_message(valid_flat_payload)
+    mock_channel = MagicMock()
+
+    # First delivery
+    process_message(msg, s3_client=mock_s3, redis_client=fake_redis, channel=mock_channel)
+    # Second delivery (simulated redelivery)
+    process_message(msg, s3_client=mock_s3, redis_client=fake_redis, channel=mock_channel)
+
+    # S3 still has exactly 1 object
+    response = mock_s3.list_objects_v2(Bucket=Buckets.MEASUREMENTS)
+    assert response["KeyCount"] == 1
+    # Redis still has status stored
+    assert fake_redis.hgetall("job:job-002")["status"] == JobStatus.STORED.value
+    # Channel was published to twice
+    assert mock_channel.basic_publish.call_count == 2
 
 
 # --- Consumer callback & lifecycle tests ---

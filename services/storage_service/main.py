@@ -228,16 +228,61 @@ def complete_job_workflow_a(job_id: str, redis_client: Any) -> None:
     logger.info("Marked job %s as %s", job_id, JobStatus.COMPLETED.value)
 
 
+def request_analysis_workflow_b(
+    msg: StorageMessage,
+    redis_client: Any,
+    channel: pika.adapters.blocking_connection.BlockingChannel | Any = None,
+) -> dict[str, Any]:
+    """Advance job to 'stored' in Redis and publish to measurement.analysis.requested.
+    
+    Per CONTRACT.md §2.2, §3, §5, and Task #22:
+    1. Sets job status to 'stored' in Redis via single-field HSET (no read-modify-write).
+    2. Publishes {job_id, measurement_id, analysis, threshold_ms} to Queues.ANALYSIS_REQUESTED.
+    3. Uses delivery_mode=2 (Persistent) and declares queue durable.
+    4. Exactly one queue is published to (one queue in, one queue out).
+    """
+    redis_client.hset(name=f"job:{msg.job_id}", key="status", value=JobStatus.STORED.value)
+    logger.info("Marked job %s as %s", msg.job_id, JobStatus.STORED.value)
+
+    payload = {
+        "job_id": msg.job_id,
+        "measurement_id": msg.measurement_id,
+        "analysis": msg.analysis or "latency_summary",
+        "threshold_ms": msg.threshold_ms if msg.threshold_ms is not None else 30,
+    }
+
+    if channel is not None:
+        channel.queue_declare(queue=Queues.ANALYSIS_REQUESTED, durable=True)
+        channel.basic_publish(
+            exchange="",
+            routing_key=Queues.ANALYSIS_REQUESTED,
+            body=json.dumps(payload).encode("utf-8"),
+            properties=pika.BasicProperties(
+                delivery_mode=pika.DeliveryMode.Persistent,
+                content_type="application/json",
+            ),
+        )
+        logger.info(
+            "Published analysis request for job %s (measurement %s) to %s",
+            msg.job_id,
+            msg.measurement_id,
+            Queues.ANALYSIS_REQUESTED,
+        )
+
+    return payload
+
+
 def process_message(
     msg: StorageMessage,
     s3_client: Any = None,
     redis_client: Any = None,
+    channel: Any = None,
 ) -> None:
     """Process a single storage job.
     
     1. Write the raw measurement to Garage S3 before metadata/job status (Task #19).
     2. Write measurement metadata to Redis (Task #20).
-    3. Update job status in Redis (Tasks #21 / #22).
+    3. Update job status in Redis & optionally forward to analytics (Tasks #21 / #22).
     """
     logger.info("Consumed storage job %s for measurement %s", msg.job_id, msg.measurement_id)
     store_raw_measurement(msg, s3_client=s3_client)
@@ -245,6 +290,8 @@ def process_message(
         store_measurement_metadata(msg, redis_client=redis_client)
         if not msg.analyze:
             complete_job_workflow_a(msg.job_id, redis_client=redis_client)
+        else:
+            request_analysis_workflow_b(msg, redis_client=redis_client, channel=channel)
 
 
 def handle_message(
@@ -258,7 +305,7 @@ def handle_message(
     """Callback handler for measurement.created messages with manual ACK/NACK."""
     try:
         msg = parse_storage_message(body)
-        process_message(msg, s3_client=s3_client, redis_client=redis_client)
+        process_message(msg, s3_client=s3_client, redis_client=redis_client, channel=ch)
     except (json.JSONDecodeError, ValueError, TypeError) as exc:
         logger.error(
             "Rejected malformed message on %s (requeue=False): %s | Raw body: %s",
@@ -387,9 +434,13 @@ def main() -> None:
             channel = connection.channel()
             context.channel = channel
 
-            # Declare durable queue
+            # Declare durable queues
             channel.queue_declare(
                 queue=Queues.MEASUREMENT_CREATED,
+                durable=True,
+            )
+            channel.queue_declare(
+                queue=Queues.ANALYSIS_REQUESTED,
                 durable=True,
             )
 
