@@ -21,10 +21,13 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
 
-from fastapi import Body, FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from api_gateway.models import AnalyzeStoredIn, MeasurementIn, SubmitAnalyzeIn
 
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -48,20 +51,45 @@ async def not_implemented_handler(
     return JSONResponse(status_code=501, content={"error": "not implemented"})
 
 
+def _validation_summary(exc: RequestValidationError) -> str:
+    first_error = exc.errors()[0]
+    location = first_error.get("loc", ())
+    field = str(location[-1]) if location else "request"
+    if first_error.get("type") == "json_invalid":
+        return "invalid JSON"
+    if first_error.get("type") == "missing":
+        return f"{field}: Field required"
+    return f"{field}: invalid value"
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"error": _validation_summary(exc)})
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(
+    request: Request, exc: StarletteHTTPException
+) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+
+
 @app.post("/measurements", status_code=202)
-def submit_measurement(body: dict[str, Any] = Body(default_factory=dict)) -> None:
+def submit_measurement(body: MeasurementIn) -> None:
     raise NotImplementedError("POST /measurements")
 
 
 @app.post("/measurements/analyze", status_code=202)
-def submit_and_analyze(body: dict[str, Any] = Body(default_factory=dict)) -> None:
+def submit_and_analyze(body: SubmitAnalyzeIn) -> None:
     raise NotImplementedError("POST /measurements/analyze")
 
 
 @app.post("/measurements/{measurement_id}/analyze", status_code=202)
 def analyze_stored_measurement(
     measurement_id: str,
-    body: dict[str, Any] = Body(default_factory=dict),
+    body: AnalyzeStoredIn,
 ) -> None:
     raise NotImplementedError("POST /measurements/{measurement_id}/analyze")
 
