@@ -102,7 +102,7 @@ def process_message(payload: dict, redis_client: redis.Redis, s3_client) -> None
         logger.info("Stored report %s", report["report_id"])
 
     except Exception as exc:
-        logger.exception("Could not store report %s", report["report_id"])
+        logger.exception("Could not store report %s for job %s", report["report_id"], job_id)
 
         # Record the failure in Redis before acknowledging the message.
         redis_client.hset(f"job:{job_id}", mapping={"status": JobStatus.FAILED_REPORT_STORAGE.value})
@@ -172,6 +172,11 @@ def main() -> None:
 
                     if not isinstance(payload, dict):
                         raise ValueError("Message payload must be a JSON object")
+                    
+                    logger.info(
+                            "Received analysis.completed for job %s",
+                            payload.get("job_id"),
+                        )
 
                     process_message(payload, redis_client, s3_client)
 
