@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
-import signal
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -34,6 +35,7 @@ from aic_common.contract import (
     MEASUREMENT_PREFIX,
     Queues,
 )
+from aic_common.rabbitmq import RabbitMQConsumer
 from aic_common.s3 import (
     get_s3_client,
     measurement_key,
@@ -42,6 +44,8 @@ from aic_common.s3 import (
 )
 
 SERVICE_NAME = "storage-service"
+HOST_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+MAX_NAME_LENGTH = 255
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -61,43 +65,92 @@ class StorageMessage(BaseModel):
     target_host: str
     metric: str
     values_ms: list[float]
-    unit: str = "ms"
+    unit: str | None = None
     timestamp: str | None = None
     packets_sent: int | None = None
     packets_received: int | None = None
     analyze: bool = False
     analysis: str | None = None
-    threshold_ms: int | float | None = 30
+    threshold_ms: int | float | None = None
 
-    @field_validator("job_id")
+    @field_validator("job_id", mode="before")
     @classmethod
-    def validate_job_id(cls, v: str) -> str:
+    def validate_job_id(cls, v: Any) -> str:
         if not isinstance(v, str) or not v.startswith(JOB_PREFIX) or v == JOB_PREFIX:
             raise ValueError(f"job_id must start with '{JOB_PREFIX}' and contain an id suffix")
         return v
 
-    @field_validator("measurement_id")
+    @field_validator("measurement_id", mode="before")
     @classmethod
-    def validate_measurement_id(cls, v: str) -> str:
+    def validate_measurement_id(cls, v: Any) -> str:
         if not isinstance(v, str) or not v.startswith(MEASUREMENT_PREFIX) or v == MEASUREMENT_PREFIX:
             raise ValueError(
                 f"measurement_id must start with '{MEASUREMENT_PREFIX}' and contain an id suffix"
             )
         return v
 
-    @field_validator("source_host", "target_host", "metric")
+    @field_validator("source_host", "target_host", mode="before")
     @classmethod
-    def validate_non_empty_str(cls, v: str) -> str:
+    def validate_host(cls, v: Any) -> str:
         if not isinstance(v, str) or not v.strip():
-            raise ValueError("Field cannot be empty")
+            raise ValueError("Host field cannot be empty")
+        cleaned = v.strip()
+        if len(cleaned) > MAX_NAME_LENGTH or cleaned in (".", "..") or not HOST_PATTERN.fullmatch(cleaned):
+            raise ValueError("Host contains invalid characters")
+        return cleaned
+
+    @field_validator("metric", mode="before")
+    @classmethod
+    def validate_metric(cls, v: Any) -> str:
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("Metric cannot be empty")
+        cleaned = v.strip()
+        if len(cleaned) > MAX_NAME_LENGTH or any(ord(c) < 32 or ord(c) == 127 for c in cleaned):
+            raise ValueError("Metric contains invalid characters")
+        return cleaned
+
+    @field_validator("values_ms", mode="before")
+    @classmethod
+    def validate_values(cls, v: Any) -> list[float]:
+        if not isinstance(v, list) or len(v) == 0:
+            raise ValueError("Measurement must contain at least 1 sample in values_ms")
+        validated: list[float] = []
+        for sample in v:
+            if isinstance(sample, bool) or not isinstance(sample, (int, float)):
+                raise ValueError("values_ms samples must be numbers")
+            if not math.isfinite(sample) or sample < 0:
+                raise ValueError("values_ms samples must be finite and non-negative")
+            validated.append(float(sample))
+        return validated
+
+    @field_validator("unit", "analysis", mode="before")
+    @classmethod
+    def validate_optional_str(cls, v: Any) -> str | None:
+        if v is None:
+            return None
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("Optional text field cannot be blank")
         return v.strip()
 
-    @field_validator("values_ms")
+    @field_validator("packets_sent", "packets_received", mode="before")
     @classmethod
-    def validate_values(cls, v: list[float]) -> list[float]:
-        if not v or len(v) == 0:
-            raise ValueError("Measurement must contain at least 1 sample in values_ms")
-        return [float(x) for x in v]
+    def validate_packets(cls, v: Any) -> int | None:
+        if v is None:
+            return None
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise ValueError("Packet counts must be non-negative integers")
+        return v
+
+    @field_validator("threshold_ms", mode="before")
+    @classmethod
+    def validate_threshold(cls, v: Any) -> int | float | None:
+        if v is None:
+            return None
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError("threshold_ms must be a number")
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError("threshold_ms must be finite and positive")
+        return v
 
     @model_validator(mode="before")
     @classmethod
@@ -125,10 +178,6 @@ class StorageMessage(BaseModel):
         # If analysis name provided but analyze flag is false/unset, set analyze=True
         if data.get("analysis") and not data.get("analyze"):
             data["analyze"] = True
-
-        # Default threshold_ms to 30 if unset
-        if data.get("threshold_ms") is None:
-            data["threshold_ms"] = 30
 
         return data
 
@@ -158,9 +207,10 @@ def build_raw_measurement_document(msg: StorageMessage) -> dict[str, Any]:
         "target_host": msg.target_host,
         "metric": msg.metric,
         "values_ms": msg.values_ms,
-        "unit": msg.unit,
         "timestamp": msg.timestamp,
     }
+    if msg.unit is not None:
+        doc["unit"] = msg.unit
     if msg.packets_sent is not None:
         doc["packets_sent"] = msg.packets_sent
     if msg.packets_received is not None:
@@ -236,12 +286,11 @@ def complete_job_workflow_a(job_id: str, redis_client: Any) -> None:
         logger.info("Job %s is already %s (idempotent redelivery)", job_id, current_status)
         return
     if current_status in (
-        JobStatus.FAILED_MEASUREMENT_STORAGE.value,
         JobStatus.FAILED_ANALYSIS.value,
         JobStatus.FAILED_REPORT_STORAGE.value,
     ):
         logger.warning(
-            "Job %s is in terminal failure '%s'; skipping transition to %s",
+            "Job %s is in terminal downstream failure '%s'; skipping transition to %s",
             job_id,
             current_status,
             JobStatus.COMPLETED.value,
@@ -320,12 +369,13 @@ def request_analysis_workflow_b(
     5. Uses delivery_mode=2 (Persistent) and declares queue durable.
     6. Exactly one queue is published to (one queue in, one queue out).
     """
-    payload = {
+    payload: dict[str, Any] = {
         "job_id": msg.job_id,
         "measurement_id": msg.measurement_id,
         "analysis": msg.analysis or "latency_summary",
-        "threshold_ms": msg.threshold_ms if msg.threshold_ms is not None else 30,
     }
+    if msg.threshold_ms is not None:
+        payload["threshold_ms"] = msg.threshold_ms
 
     current_status = redis_client.hget(f"job:{msg.job_id}", "status") if redis_client is not None else None
 
@@ -454,44 +504,6 @@ def handle_message(
     ch.basic_ack(delivery_tag=method.delivery_tag)
 
 
-def connect_rabbitmq(
-    host: str | None = None,
-    port: int | None = None,
-    user: str | None = None,
-    password: str | None = None,
-    retry_interval: float = 5.0,
-) -> pika.BlockingConnection:
-    """Connect to RabbitMQ, retrying while the broker is unavailable."""
-    host = host or os.getenv("RABBITMQ_HOST", "rabbitmq")
-    port = port or int(os.getenv("RABBITMQ_PORT", "5672"))
-    user = user or os.getenv("RABBITMQ_USER", "guest")
-    password = password or os.getenv("RABBITMQ_PASSWORD", "guest")
-
-    credentials = pika.PlainCredentials(user, password)
-    parameters = pika.ConnectionParameters(
-        host=host,
-        port=port,
-        credentials=credentials,
-        heartbeat=60,
-        blocked_connection_timeout=30,
-    )
-
-    while True:
-        try:
-            connection = pika.BlockingConnection(parameters)
-            logger.info("Connected to RabbitMQ at %s:%s", host, port)
-            return connection
-        except (pika.exceptions.AMQPConnectionError, OSError) as exc:
-            logger.warning(
-                "RabbitMQ at %s:%s unavailable (%s). Retrying in %.0f seconds...",
-                host,
-                port,
-                exc,
-                retry_interval,
-            )
-            time.sleep(retry_interval)
-
-
 def connect_redis(
     host: str | None = None,
     port: int | None = None,
@@ -505,6 +517,8 @@ def connect_redis(
         host=host,
         port=port,
         decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=5,
     )
 
     while True:
@@ -523,99 +537,28 @@ def connect_redis(
             time.sleep(retry_interval)
 
 
-class ConsumerContext:
-    """Manages consumer connection and graceful shutdown state."""
-
-    def __init__(self) -> None:
-        self.stop_requested = False
-        self.connection: pika.BlockingConnection | None = None
-        self.channel: pika.adapters.blocking_connection.BlockingChannel | None = None
-
-    def request_stop(self) -> None:
-        self.stop_requested = True
-        if self.channel and self.channel.is_open:
-            try:
-                self.channel.stop_consuming()
-            except Exception:
-                pass
-
-
 def main() -> None:
     """Connect to the broker and consume `Queues.MEASUREMENT_CREATED` forever."""
-    context = ConsumerContext()
-
-    def handle_signal(signum: int, frame: Any) -> None:
-        logger.info("Received signal %s. Initiating graceful shutdown...", signum)
-        context.request_stop()
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            signal.signal(sig, handle_signal)
-        except (ValueError, AttributeError) as exc:
-            logger.debug("Could not register signal %s: %s", sig, exc)
-
     logger.info("Starting %s...", SERVICE_NAME)
     s3_client = get_s3_client()
     redis_client = connect_redis()
 
-    while not context.stop_requested:
-        try:
-            connection = connect_rabbitmq()
-            context.connection = connection
-            channel = connection.channel()
-            context.channel = channel
-
-            # Declare durable queues
-            channel.queue_declare(
-                queue=Queues.MEASUREMENT_CREATED,
-                durable=True,
-            )
-            channel.queue_declare(
-                queue=Queues.ANALYSIS_REQUESTED,
-                durable=True,
-            )
-            channel.queue_declare(
-                queue=Queues.MEASUREMENT_FAILED,
-                durable=True,
-            )
-
-            # Fair dispatch: prefetch count = 1
-            channel.basic_qos(prefetch_count=1)
-
-            def callback(ch, method, properties, body):
-                handle_message(
-                    ch,
-                    method,
-                    properties,
-                    body,
-                    s3_client=s3_client,
-                    redis_client=redis_client,
-                )
-
-            channel.basic_consume(
-                queue=Queues.MEASUREMENT_CREATED,
-                on_message_callback=callback,
-                auto_ack=False,
-            )
-
-            logger.info("Waiting for %s messages...", Queues.MEASUREMENT_CREATED)
-            channel.start_consuming()
-
-        except (pika.exceptions.AMQPError, OSError) as exc:
-            if context.stop_requested:
-                break
-            logger.exception("RabbitMQ connection dropped (%s). Reconnecting in 5s...", exc)
-            time.sleep(5)
-        except KeyboardInterrupt:
-            logger.info("KeyboardInterrupt received, stopping...")
-            break
-        finally:
-            if context.connection and context.connection.is_open:
-                try:
-                    context.connection.close()
-                except Exception:
-                    pass
-
+    consumer = RabbitMQConsumer(
+        queue=Queues.MEASUREMENT_CREATED,
+        handler=lambda ch, method, properties, body: handle_message(
+            ch,
+            method,
+            properties,
+            body,
+            s3_client=s3_client,
+            redis_client=redis_client,
+        ),
+        prefetch_count=1,
+        auto_decode_json=False,
+        auto_ack_on_success=False,
+        declare_all_queues=True,
+    )
+    consumer.start(setup_signals=True)
     logger.info("%s stopped cleanly.", SERVICE_NAME)
 
 
