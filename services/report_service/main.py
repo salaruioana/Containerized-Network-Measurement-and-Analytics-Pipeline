@@ -28,6 +28,7 @@ from aic_common.contract import (
     JobStatus,
     Queues,
 )
+from aic_common.rabbitmq import RabbitMQConsumer
 from aic_common.s3 import (
     get_s3_client,
     put_json,
@@ -120,98 +121,56 @@ def process_message(payload: dict, redis_client: redis.Redis, s3_client) -> None
 
     logger.info("Job %s completed", job_id)
 
-def connect_rabbitmq() -> pika.BlockingConnection:
-    """Connect to RabbitMQ, retrying while the broker is unavailable."""
-    credentials = pika.PlainCredentials(
-        os.getenv("RABBITMQ_USER", "guest"),
-        os.getenv("RABBITMQ_PASSWORD", "guest"),
-    )
-
-    while True:
-        try:
-            connection = pika.BlockingConnection(
-                pika.ConnectionParameters(
-                    host=os.getenv("RABBITMQ_HOST", "rabbitmq"),
-                    port=int(os.getenv("RABBITMQ_PORT", "5672")),
-                    credentials=credentials,
-                    heartbeat=60,
-                    blocked_connection_timeout=30,
-                )
-            )
-            logger.info("Connected to RabbitMQ")
-            return connection
-
-        except (pika.exceptions.AMQPConnectionError, OSError):
-            logger.warning("RabbitMQ unavailable. Retrying in 5 seconds...")
-            time.sleep(5)
+def handle_message(
+    ch: Any,
+    method: Any,
+    properties: Any,
+    body: bytes,
+    redis_client: redis.Redis,
+    s3_client: Any,
+) -> None:
+    """Handle one analysis.completed message with manual ACK/NACK."""
+    try:
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError("Message payload must be a JSON object")
+        process_message(payload, redis_client, s3_client)
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+        logger.error("Invalid analysis.completed message: %s", exc)
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+    except ReportStorageError:
+        # Failure status was recorded in Redis; ACK so message is not redelivered
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+    except Exception:
+        logger.exception("Report processing failed")
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+    else:
+        ch.basic_ack(delivery_tag=method.delivery_tag)
 
 
 def main() -> None:
     """Connect to the broker and consume `Queues.ANALYSIS_COMPLETED` forever."""
+    logger.info("Starting %s...", SERVICE_NAME)
     redis_client = connect_redis()
     s3_client = get_s3_client()
 
-    while True:
-        connection = None
-
-        try:
-            connection = connect_rabbitmq()
-            channel = connection.channel()
-
-            # The consumer declares the queue as durable.
-            channel.queue_declare(
-                queue=Queues.ANALYSIS_COMPLETED,
-                durable=True,
-            )
-
-            channel.basic_qos(prefetch_count=1)
-
-            def callback(ch, method, properties, body):
-                try:
-                    payload = json.loads(body)
-
-                    if not isinstance(payload, dict):
-                        raise ValueError("Message payload must be a JSON object")
-
-                    process_message(payload, redis_client, s3_client)
-
-                except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
-                    logger.error("Invalid analysis.completed message: %s", exc)
-                    ch.basic_nack(
-                        delivery_tag=method.delivery_tag,
-                        requeue=False,
-                    )
-
-                except ReportStorageError:
-                    # The failure status was successfully saved in Redis.
-                    ch.basic_ack(delivery_tag=method.delivery_tag)
-
-                except Exception:
-                    logger.exception("Report processing failed")
-                    ch.basic_nack(
-                        delivery_tag=method.delivery_tag,
-                        requeue=True,
-                    )
-
-                else:
-                    ch.basic_ack(delivery_tag=method.delivery_tag)
-
-            channel.basic_consume(
-                queue=Queues.ANALYSIS_COMPLETED,
-                on_message_callback=callback,
-                auto_ack=False,
-            )
-
-            logger.info("Waiting for analysis.completed messages")
-            channel.start_consuming()
-
-        except (pika.exceptions.AMQPError, OSError):
-            logger.exception("RabbitMQ connection lost. Reconnecting...")
-            time.sleep(5)
-
-        finally:
-            if connection is not None and connection.is_open:
-                connection.close()
+    consumer = RabbitMQConsumer(
+        queue=Queues.ANALYSIS_COMPLETED,
+        handler=lambda ch, method, properties, body: handle_message(
+            ch,
+            method,
+            properties,
+            body,
+            redis_client=redis_client,
+            s3_client=s3_client,
+        ),
+        prefetch_count=1,
+        auto_decode_json=False,
+        auto_ack_on_success=False,
+        declare_all_queues=True,
+    )
+    consumer.start(setup_signals=True)
+    logger.info("%s stopped cleanly.", SERVICE_NAME)
 
 
 if __name__ == "__main__":

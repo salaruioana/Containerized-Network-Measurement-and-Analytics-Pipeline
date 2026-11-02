@@ -34,6 +34,10 @@ from aic_common.contract import (
     MEASUREMENT_PREFIX,
     Queues,
 )
+from aic_common.rabbitmq import (
+    RabbitMQConsumer,
+    declare_durable_queues,
+)
 from aic_common.s3 import (
     get_s3_client,
     measurement_key,
@@ -454,44 +458,6 @@ def handle_message(
     ch.basic_ack(delivery_tag=method.delivery_tag)
 
 
-def connect_rabbitmq(
-    host: str | None = None,
-    port: int | None = None,
-    user: str | None = None,
-    password: str | None = None,
-    retry_interval: float = 5.0,
-) -> pika.BlockingConnection:
-    """Connect to RabbitMQ, retrying while the broker is unavailable."""
-    host = host or os.getenv("RABBITMQ_HOST", "rabbitmq")
-    port = port or int(os.getenv("RABBITMQ_PORT", "5672"))
-    user = user or os.getenv("RABBITMQ_USER", "guest")
-    password = password or os.getenv("RABBITMQ_PASSWORD", "guest")
-
-    credentials = pika.PlainCredentials(user, password)
-    parameters = pika.ConnectionParameters(
-        host=host,
-        port=port,
-        credentials=credentials,
-        heartbeat=60,
-        blocked_connection_timeout=30,
-    )
-
-    while True:
-        try:
-            connection = pika.BlockingConnection(parameters)
-            logger.info("Connected to RabbitMQ at %s:%s", host, port)
-            return connection
-        except (pika.exceptions.AMQPConnectionError, OSError) as exc:
-            logger.warning(
-                "RabbitMQ at %s:%s unavailable (%s). Retrying in %.0f seconds...",
-                host,
-                port,
-                exc,
-                retry_interval,
-            )
-            time.sleep(retry_interval)
-
-
 def connect_redis(
     host: str | None = None,
     port: int | None = None,
@@ -526,13 +492,16 @@ def connect_redis(
 class ConsumerContext:
     """Manages consumer connection and graceful shutdown state."""
 
-    def __init__(self) -> None:
+    def __init__(self, consumer: RabbitMQConsumer | None = None) -> None:
         self.stop_requested = False
+        self._consumer = consumer
         self.connection: pika.BlockingConnection | None = None
         self.channel: pika.adapters.blocking_connection.BlockingChannel | None = None
 
     def request_stop(self) -> None:
         self.stop_requested = True
+        if self._consumer is not None:
+            self._consumer.request_stop()
         if self.channel and self.channel.is_open:
             try:
                 self.channel.stop_consuming()
@@ -542,80 +511,26 @@ class ConsumerContext:
 
 def main() -> None:
     """Connect to the broker and consume `Queues.MEASUREMENT_CREATED` forever."""
-    context = ConsumerContext()
-
-    def handle_signal(signum: int, frame: Any) -> None:
-        logger.info("Received signal %s. Initiating graceful shutdown...", signum)
-        context.request_stop()
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            signal.signal(sig, handle_signal)
-        except (ValueError, AttributeError) as exc:
-            logger.debug("Could not register signal %s: %s", sig, exc)
-
     logger.info("Starting %s...", SERVICE_NAME)
     s3_client = get_s3_client()
     redis_client = connect_redis()
 
-    while not context.stop_requested:
-        try:
-            connection = connect_rabbitmq()
-            context.connection = connection
-            channel = connection.channel()
-            context.channel = channel
-
-            # Declare durable queues
-            channel.queue_declare(
-                queue=Queues.MEASUREMENT_CREATED,
-                durable=True,
-            )
-            channel.queue_declare(
-                queue=Queues.ANALYSIS_REQUESTED,
-                durable=True,
-            )
-            channel.queue_declare(
-                queue=Queues.MEASUREMENT_FAILED,
-                durable=True,
-            )
-
-            # Fair dispatch: prefetch count = 1
-            channel.basic_qos(prefetch_count=1)
-
-            def callback(ch, method, properties, body):
-                handle_message(
-                    ch,
-                    method,
-                    properties,
-                    body,
-                    s3_client=s3_client,
-                    redis_client=redis_client,
-                )
-
-            channel.basic_consume(
-                queue=Queues.MEASUREMENT_CREATED,
-                on_message_callback=callback,
-                auto_ack=False,
-            )
-
-            logger.info("Waiting for %s messages...", Queues.MEASUREMENT_CREATED)
-            channel.start_consuming()
-
-        except (pika.exceptions.AMQPError, OSError) as exc:
-            if context.stop_requested:
-                break
-            logger.exception("RabbitMQ connection dropped (%s). Reconnecting in 5s...", exc)
-            time.sleep(5)
-        except KeyboardInterrupt:
-            logger.info("KeyboardInterrupt received, stopping...")
-            break
-        finally:
-            if context.connection and context.connection.is_open:
-                try:
-                    context.connection.close()
-                except Exception:
-                    pass
-
+    consumer = RabbitMQConsumer(
+        queue=Queues.MEASUREMENT_CREATED,
+        handler=lambda ch, method, properties, body: handle_message(
+            ch,
+            method,
+            properties,
+            body,
+            s3_client=s3_client,
+            redis_client=redis_client,
+        ),
+        prefetch_count=1,
+        auto_decode_json=False,
+        auto_ack_on_success=False,
+        declare_all_queues=True,
+    )
+    consumer.start(setup_signals=True)
     logger.info("%s stopped cleanly.", SERVICE_NAME)
 
 
