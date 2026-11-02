@@ -146,6 +146,7 @@ class RabbitMQPublisher:
         password: str | None = None,
         parameters: pika.ConnectionParameters | None = None,
     ) -> None:
+        self.settings = settings
         if settings is not None:
             self.parameters = get_connection_parameters(
                 host=getattr(settings, "rabbitmq_host", host),
