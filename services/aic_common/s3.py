@@ -51,7 +51,12 @@ def get_s3_client(
     access_key = aws_access_key_id or os.getenv("S3_ACCESS_KEY")
     secret_key = aws_secret_access_key or os.getenv("S3_SECRET_KEY")
 
-    config = Config(s3={"addressing_style": "path"})
+    config = Config(
+        s3={"addressing_style": "path"},
+        connect_timeout=5,
+        read_timeout=10,
+        retries={"max_attempts": 2},
+    )
 
     kwargs: dict[str, Any] = {
         "endpoint_url": endpoint,
@@ -80,11 +85,19 @@ def put_json(
         client = get_s3_client()
 
     if hasattr(data, "model_dump"):
-        payload = json.dumps(data.model_dump(exclude_none=True), ensure_ascii=False)
+        payload = json.dumps(
+            data.model_dump(exclude_none=True),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
     elif hasattr(data, "dict"):
-        payload = json.dumps(data.dict(exclude_none=True), ensure_ascii=False)
+        payload = json.dumps(
+            data.dict(exclude_none=True),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
     else:
-        payload = json.dumps(data, ensure_ascii=False)
+        payload = json.dumps(data, ensure_ascii=False, allow_nan=False)
 
     client.put_object(
         Bucket=bucket,
@@ -133,7 +146,7 @@ def exists(
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
         status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-        if code in ("NoSuchKey", "NotFound", "404") or status == 404:
+        if code in ("NoSuchKey", "NotFound", "NoSuchBucket", "404") or status == 404:
             return False
         raise
 
@@ -172,4 +185,26 @@ def report_key(report_id: str) -> str:
 def report_object_path(report_id: str) -> str:
     """Generate object_path for report document (e.g. 'reports/r-001.json')."""
     return f"{Buckets.REPORTS}/{report_key(report_id)}"
+
+
+def parse_object_path(object_path: str) -> tuple[str, str]:
+    """Split a Redis metadata object_path (e.g. 'measurements/h1-h2/m-001.json') into (bucket, key)."""
+    if not isinstance(object_path, str) or not object_path.strip():
+        raise ValueError("Invalid object_path: must be a non-empty string")
+    normalized = object_path.strip().lstrip("/")
+    bucket, sep, key = normalized.partition("/")
+    if not sep or not bucket or not key:
+        raise ValueError(f"Invalid object_path '{object_path}': expected '<bucket>/<key>'")
+    return bucket, key
+
+
+def key_from_object_path(object_path: str, expected_bucket: str | None = None) -> str:
+    """Extract the S3 object key from an object_path, optionally verifying the bucket prefix."""
+    bucket, key = parse_object_path(object_path)
+    if expected_bucket is not None and bucket != expected_bucket:
+        raise ValueError(
+            f"Unexpected bucket '{bucket}' in object_path '{object_path}' (expected '{expected_bucket}')"
+        )
+    return key
+
 

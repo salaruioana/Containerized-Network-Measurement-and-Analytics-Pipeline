@@ -12,18 +12,20 @@ from unittest.mock import MagicMock
 import boto3
 import pika
 import pytest
+import redis
 from moto import mock_aws
 
 from aic_common.contract import Buckets, JobStatus, Queues
 from aic_common.s3 import exists, get_json
 from storage_service.main import (
-    ConsumerContext,
     StorageMessage,
     StorageWriteError,
     build_raw_measurement_document,
     complete_job_workflow_a,
+    connect_redis,
     handle_message,
     handle_storage_failure,
+    main,
     parse_storage_message,
     process_message,
     request_analysis_workflow_b,
@@ -163,7 +165,8 @@ def test_parse_values_alias():
     msg = parse_storage_message(payload)
     assert msg.values_ms == [20.0, 25.0, 30.0]
     assert msg.timestamp is not None
-    assert msg.threshold_ms == 30
+    assert msg.unit is None
+    assert msg.threshold_ms is None
 
 
 def test_parse_analysis_infers_analyze_flag():
@@ -245,6 +248,7 @@ def test_build_raw_measurement_document_without_packets():
     msg = parse_storage_message(payload)
     doc = build_raw_measurement_document(msg)
 
+    assert "unit" not in doc
     assert "packets_sent" not in doc
     assert "packets_received" not in doc
     assert doc["measurement_id"] == "m-005"
@@ -960,13 +964,128 @@ def test_handle_message_nack_requeue_on_unexpected_error(monkeypatch, mock_s3, v
     channel.basic_ack.assert_not_called()
 
 
-def test_consumer_context_stop():
-    context = ConsumerContext()
-    mock_channel = MagicMock()
-    mock_channel.is_open = True
-    context.channel = mock_channel
+@pytest.mark.parametrize("bad_sample", [float("nan"), float("inf"), -1.0, True, "10"])
+def test_invalid_samples_rejected(valid_flat_payload, bad_sample):
+    valid_flat_payload["values_ms"] = [bad_sample]
+    with pytest.raises(ValueError):
+        parse_storage_message(valid_flat_payload)
 
-    assert context.stop_requested is False
-    context.request_stop()
-    assert context.stop_requested is True
-    mock_channel.stop_consuming.assert_called_once()
+
+@pytest.mark.parametrize("bad_host", ["h/1", "h 1", "..", "."])
+def test_invalid_host_characters_rejected(valid_flat_payload, bad_host):
+    valid_flat_payload["source_host"] = bad_host
+    with pytest.raises(ValueError):
+        parse_storage_message(valid_flat_payload)
+
+
+def test_invalid_metric_unit_packets_and_threshold_rejected(valid_flat_payload):
+    for field, bad_val in (
+        ("metric", "lat\x00ency"),
+        ("unit", "   "),
+        ("packets_sent", -1),
+        ("packets_received", True),
+        ("threshold_ms", 0),
+        ("threshold_ms", -5),
+        ("threshold_ms", True),
+        ("threshold_ms", float("inf")),
+    ):
+        payload = dict(valid_flat_payload)
+        payload[field] = bad_val
+        with pytest.raises(ValueError):
+            parse_storage_message(payload)
+
+    # JSON array instead of JSON object
+    with pytest.raises(ValueError):
+        parse_storage_message("[1, 2, 3]")
+
+
+def test_workflow_b_omits_threshold_when_none(fake_redis):
+    fake_redis.hset(
+        "job:job-010",
+        mapping={"measurement_id": "m-010", "status": JobStatus.QUEUED.value},
+    )
+    msg = parse_storage_message(
+        {
+            "job_id": "job-010",
+            "measurement_id": "m-010",
+            "source_host": "h1",
+            "target_host": "h2",
+            "metric": "throughput",
+            "values_ms": [90, 100],
+            "analysis": "throughput_summary",
+        }
+    )
+    mock_channel = MagicMock()
+    published = request_analysis_workflow_b(msg, fake_redis, channel=mock_channel)
+    assert "threshold_ms" not in published
+    assert published == {
+        "job_id": "job-010",
+        "measurement_id": "m-010",
+        "analysis": "throughput_summary",
+    }
+
+
+def test_workflow_a_downstream_failure_guard_and_storage_failure_resilience(fake_redis):
+    # Downstream terminal failure is never overwritten by a stale Workflow A redelivery
+    fake_redis.hset(
+        "job:job-err",
+        mapping={"measurement_id": "m-err", "status": JobStatus.FAILED_ANALYSIS.value},
+    )
+    complete_job_workflow_a("job-err", fake_redis)
+    assert fake_redis.hgetall("job:job-err")["status"] == JobStatus.FAILED_ANALYSIS.value
+
+    # handle_storage_failure swallows secondary Redis and RabbitMQ errors safely
+    broken_redis = MagicMock()
+    broken_redis.hset.side_effect = RuntimeError("Redis completely unreachable")
+    broken_channel = MagicMock()
+    broken_channel.basic_publish.side_effect = RuntimeError("Broker closed")
+
+    handle_storage_failure(
+        job_id="job-err",
+        exc=RuntimeError("Primary S3 error"),
+        redis_client=broken_redis,
+        channel=broken_channel,
+        measurement_id="m-err",
+    )
+
+
+def test_connect_redis_retries_until_healthy_and_main(monkeypatch, mock_s3, fake_redis):
+    created_kwargs = {}
+    attempts = [0]
+
+    class StubRedis:
+        def ping(self):
+            attempts[0] += 1
+            if attempts[0] == 1:
+                raise redis.ConnectionError("Redis starting")
+            return True
+
+    def fake_redis_cls(**kwargs):
+        created_kwargs.update(kwargs)
+        return StubRedis()
+
+    monkeypatch.setattr("storage_service.main.redis.Redis", fake_redis_cls)
+    client = connect_redis(host="redis-test", port=6380, retry_interval=0.001)
+    assert isinstance(client, StubRedis)
+    assert attempts[0] == 2
+    assert created_kwargs["socket_connect_timeout"] == 5
+    assert created_kwargs["socket_timeout"] == 5
+
+    # Verify main() wires clients and starts consumer on Queues.MEASUREMENT_CREATED
+    started = {}
+
+    class StubConsumer:
+        def __init__(self, **kwargs):
+            started.update(kwargs)
+
+        def start(self, setup_signals: bool = False):
+            started["setup_signals"] = setup_signals
+
+    monkeypatch.setattr("storage_service.main.get_s3_client", lambda: mock_s3)
+    monkeypatch.setattr("storage_service.main.connect_redis", lambda: fake_redis)
+    monkeypatch.setattr("storage_service.main.RabbitMQConsumer", StubConsumer)
+
+    main()
+    assert started["queue"] == Queues.MEASUREMENT_CREATED
+    assert started["setup_signals"] is True
+

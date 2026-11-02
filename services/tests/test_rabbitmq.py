@@ -447,3 +447,130 @@ def test_consumer_request_stop_stops_consuming() -> None:
     assert consumer.stop_requested is True
     assert channel.stop_consuming_called is True
 
+
+def test_publisher_reconnects_on_closed_channel_and_channel_error(monkeypatch) -> None:
+    first_ch = FakeChannel()
+    first_ch.publish_error = pika.exceptions.ChannelWrongStateError("Channel closed")
+    second_ch = FakeChannel()
+    third_ch = FakeChannel()
+
+    connections = [FakeConnection(first_ch), FakeConnection(second_ch), FakeConnection(third_ch)]
+    monkeypatch.setattr(pika, "BlockingConnection", lambda params: connections.pop(0))
+
+    params = get_connection_parameters()
+    pub = RabbitMQPublisher(parameters=params)
+    # 1. Retries once when ChannelWrongStateError occurs
+    pub.publish("test.queue", {"data": 1})
+    assert len(second_ch.published) == 1
+
+    # 2. Reconnects proactively if channel.is_closed is True
+    second_ch.is_closed = True  # type: ignore[attr-defined]
+    pub.publish("test.queue", [1, 2, 3])
+    assert len(third_ch.published) == 1
+    assert json.loads(third_ch.published[0]["body"].decode()) == [1, 2, 3]
+
+
+def test_publisher_legacy_dict_primitive_and_non_retryable_amqp_error(monkeypatch) -> None:
+    channel = FakeChannel()
+    conn = FakeConnection(channel)
+    monkeypatch.setattr(pika, "BlockingConnection", lambda params: conn)
+
+    pub = RabbitMQPublisher()
+
+    class LegacyModel:
+        def dict(self, exclude_none: bool = False):
+            return {"legacy": True}
+
+    pub.publish("test.queue", LegacyModel())
+    assert json.loads(channel.published[-1]["body"].decode()) == {"legacy": True}
+
+    pub.publish("test.queue", 42)
+    assert json.loads(channel.published[-1]["body"].decode()) == 42
+
+    # Generic non-connection AMQPError converts to PublishError without second reconnect
+    channel.publish_error = pika.exceptions.AMQPError("Generic protocol error")
+    with pytest.raises(PublishError, match="Publish failed"):
+        pub.publish("test.queue", {"a": 1})
+
+
+def test_consumer_dispatch_two_three_param_and_raw_bytes() -> None:
+    captured = {}
+
+    def two_param_handler(data, properties) -> None:
+        captured["two"] = (data, properties)
+
+    def three_param_handler(data, properties, method) -> None:
+        captured["three"] = (data, properties, method.delivery_tag)
+
+    channel = FakeChannel()
+    method = Mock(delivery_tag=201)
+    props = Mock()
+
+    c2 = RabbitMQConsumer(queue="test.queue", handler=two_param_handler, auto_decode_json=False)
+    c2._dispatch_message(channel, method, props, b"raw-payload")
+    assert captured["two"] == (b"raw-payload", props)
+
+    c3 = RabbitMQConsumer(queue="test.queue", handler=three_param_handler)
+    c3._dispatch_message(channel, method, props, b'{"x": 1}')
+    assert captured["three"] == ({"x": 1}, props, 201)
+
+
+def test_consumer_stops_cleanly_when_cancelled_during_connect_retry(monkeypatch) -> None:
+    registered_signals: dict[int, object] = {}
+    monkeypatch.setattr(
+        "aic_common.rabbitmq.signal.signal",
+        lambda sig, handler: registered_signals.setdefault(sig, handler),
+    )
+    consumer = RabbitMQConsumer(
+        queue="test.queue",
+        handler=Mock(),
+        retry_interval=0.001,
+        declare_all_queues=False,
+    )
+
+    def fail_then_stop(params):
+        # Invoke the registered signal handler as if SIGTERM arrived
+        for sig, sig_handler in registered_signals.items():
+            sig_handler(sig, None)  # type: ignore[operator]
+        raise pika.exceptions.AMQPConnectionError("Broker still starting")
+
+    monkeypatch.setattr(pika, "BlockingConnection", fail_then_stop)
+
+    # Must return cleanly without raising RabbitMQError
+    consumer.start(setup_signals=True)
+    assert consumer.stop_requested is True
+    assert len(registered_signals) >= 1
+
+
+def test_consumer_reconnects_after_connection_drop_and_consume_helper(monkeypatch) -> None:
+    ch1 = FakeChannel()
+    ch2 = FakeChannel()
+    conns = [FakeConnection(ch1), FakeConnection(ch2)]
+    monkeypatch.setattr(pika, "BlockingConnection", lambda params: conns.pop(0))
+
+    consumer_ref: list[RabbitMQConsumer] = []
+
+    def drop_once():
+        raise pika.exceptions.AMQPConnectionError("Dropped mid-consume")
+
+    def stop_second():
+        # Also invoke registered callback once before stopping
+        cb = ch2.consume_calls[0]["on_message_callback"]
+        cb(ch2, Mock(delivery_tag=1), Mock(), b'{"ok": true}')
+        consumer_ref[0].request_stop()
+
+    ch1.start_consuming = drop_once
+    ch2.start_consuming = stop_second
+
+    received = []
+    c = consume("single.queue", lambda d: received.append(d), start_now=False)
+    c.retry_interval = 0.001
+    c.declare_all_queues = False
+    consumer_ref.append(c)
+    c.start()
+
+    assert received == [{"ok": True}]
+    assert ch2.declarations == [{"queue": "single.queue", "durable": True}]
+    assert ch2.ack_calls == [{"delivery_tag": 1, "multiple": False}]
+
+

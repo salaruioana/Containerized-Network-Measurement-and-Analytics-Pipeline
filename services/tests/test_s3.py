@@ -9,16 +9,19 @@ from __future__ import annotations
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 from moto import mock_aws
 
-from aic_common.contract import Buckets
+from aic_common.contract import AnalyticsResult, Buckets
 from aic_common.s3 import (
     S3ObjectNotFoundError,
     exists,
     get_json,
     get_s3_client,
+    key_from_object_path,
     measurement_key,
     measurement_object_path,
+    parse_object_path,
     put_json,
     report_id_for,
     report_key,
@@ -47,8 +50,11 @@ def test_get_s3_client_config(monkeypatch):
     client = get_s3_client()
     assert client.meta.endpoint_url == "http://test-garage:3900"
     assert client.meta.region_name == "test-region"
-    # Ensure path-style addressing is explicitly configured for Garage compatibility
+    # Ensure path-style addressing and bounded timeouts are configured for Garage
     assert client.meta.config.s3.get("addressing_style") == "path"
+    assert client.meta.config.connect_timeout == 5
+    assert client.meta.config.read_timeout == 10
+    assert client.meta.config.retries.get("total_max_attempts") == 3
 
 
 def test_put_and_get_json():
@@ -114,3 +120,85 @@ def test_report_id_for():
 
     with pytest.raises(ValueError):
         report_id_for(None)
+
+
+def test_parse_and_key_from_object_path():
+    bucket, key = parse_object_path("measurements/h1-h2/m-001.json")
+    assert bucket == Buckets.MEASUREMENTS
+    assert key == "h1-h2/m-001.json"
+
+    assert (
+        key_from_object_path("measurements/h1-h2/m-001.json", expected_bucket=Buckets.MEASUREMENTS)
+        == "h1-h2/m-001.json"
+    )
+    assert key_from_object_path("/reports/r-001.json", expected_bucket=Buckets.REPORTS) == "r-001.json"
+
+    for invalid_path in ("", "   ", "measurements", "measurements/", None):
+        with pytest.raises(ValueError):
+            parse_object_path(invalid_path)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="Unexpected bucket"):
+        key_from_object_path("reports/r-001.json", expected_bucket=Buckets.MEASUREMENTS)
+
+
+def test_put_json_pydantic_legacy_dict_and_nan_rejection():
+    with mock_aws():
+        client = boto3.client("s3", region_name="us-east-1")
+        client.create_bucket(Bucket=Buckets.REPORTS)
+
+        model = AnalyticsResult(
+            measurement_id="m-001",
+            metric="latency",
+            sample_count=3,
+            average_latency_ms=12.5,
+        )
+        put_json(Buckets.REPORTS, "r-001.json", model, client=client)
+        stored = get_json(Buckets.REPORTS, "r-001.json", client=client)
+        assert stored["measurement_id"] == "m-001"
+        assert stored["average_latency_ms"] == 12.5
+        assert "throughput_avg_mbps" not in stored
+
+        class LegacyDictModel:
+            def dict(self, exclude_none: bool = False):
+                return {"measurement_id": "m-002", "ok": True}
+
+        put_json(Buckets.REPORTS, "r-002.json", LegacyDictModel(), client=client)
+        assert get_json(Buckets.REPORTS, "r-002.json", client=client) == {
+            "measurement_id": "m-002",
+            "ok": True,
+        }
+
+        with pytest.raises(ValueError):
+            put_json(Buckets.REPORTS, "r-nan.json", {"bad": float("nan")}, client=client)
+
+
+def test_default_s3_client_and_non_404_client_errors(monkeypatch):
+    with mock_aws():
+        client = boto3.client("s3", region_name="us-east-1")
+        client.create_bucket(Bucket=Buckets.MEASUREMENTS)
+        monkeypatch.setattr("aic_common.s3.get_s3_client", lambda: client)
+
+        put_json(Buckets.MEASUREMENTS, "h1-h2/m-def.json", {"v": 1})
+        assert exists(Buckets.MEASUREMENTS, "h1-h2/m-def.json") is True
+        assert get_json(Buckets.MEASUREMENTS, "h1-h2/m-def.json") == {"v": 1}
+        assert exists("nonexistent-bucket", "h1-h2/m-def.json") is False
+
+    class FailingS3Client:
+        def get_object(self, **kwargs):
+            raise ClientError(
+                {"Error": {"Code": "InternalError", "Message": "Server error"}, "ResponseMetadata": {"HTTPStatusCode": 500}},
+                "GetObject",
+            )
+
+        def head_object(self, **kwargs):
+            raise ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "Forbidden"}, "ResponseMetadata": {"HTTPStatusCode": 403}},
+                "HeadObject",
+            )
+
+    failing = FailingS3Client()
+    with pytest.raises(ClientError):
+        get_json(Buckets.MEASUREMENTS, "k.json", client=failing)
+    with pytest.raises(ClientError):
+        exists(Buckets.MEASUREMENTS, "k.json", client=failing)
+

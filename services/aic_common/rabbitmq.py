@@ -182,7 +182,12 @@ class RabbitMQPublisher:
                 logger.debug("Could not close broken RabbitMQ connection", exc_info=True)
 
     def _publish_once(self, queue: str, payload: Any, mandatory: bool = True) -> None:
-        if self._connection is None or self._channel is None:
+        if (
+            self._connection is None
+            or getattr(self._connection, "is_closed", False)
+            or self._channel is None
+            or getattr(self._channel, "is_closed", False)
+        ):
             self._connect()
 
         if queue not in self._declared_queues:
@@ -190,17 +195,25 @@ class RabbitMQPublisher:
             self._declared_queues.add(queue)
 
         if hasattr(payload, "model_dump"):
-            body = json.dumps(payload.model_dump(exclude_none=True), ensure_ascii=False).encode("utf-8")
+            body = json.dumps(
+                payload.model_dump(exclude_none=True),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
         elif hasattr(payload, "dict"):
-            body = json.dumps(payload.dict(exclude_none=True), ensure_ascii=False).encode("utf-8")
+            body = json.dumps(
+                payload.dict(exclude_none=True),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
         elif isinstance(payload, (dict, list)):
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
         elif isinstance(payload, str):
             body = payload.encode("utf-8")
         elif isinstance(payload, bytes):
             body = payload
         else:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
 
         properties = pika.BasicProperties(
             content_type="application/json",
@@ -217,10 +230,10 @@ class RabbitMQPublisher:
             )
             if confirmed is False:
                 raise PublishError(f"Broker rejected/nacked message for queue '{queue}'")
-        except (
-            pika.exceptions.NackError,
-            pika.exceptions.UnroutableError,
-        ) as exc:
+        except pika.exceptions.UnroutableError as exc:
+            self._declared_queues.discard(queue)
+            raise PublishError(f"Broker did not confirm delivery to queue '{queue}': {exc}") from exc
+        except pika.exceptions.NackError as exc:
             raise PublishError(f"Broker did not confirm delivery to queue '{queue}': {exc}") from exc
 
     def publish(self, queue: str, payload: Any, mandatory: bool = True) -> None:
@@ -228,6 +241,8 @@ class RabbitMQPublisher:
         connection_errors = (
             pika.exceptions.AMQPConnectionError,
             pika.exceptions.StreamLostError,
+            pika.exceptions.ChannelWrongStateError,
+            pika.exceptions.ChannelClosed,
             OSError,
         )
 
@@ -389,6 +404,10 @@ class RabbitMQConsumer:
                 logger.info("Consuming queue %s (prefetch=%d)...", self.queue, self.prefetch_count)
                 self.channel.start_consuming()
 
+            except RabbitMQError:
+                if self.stop_requested:
+                    break
+                raise
             except (pika.exceptions.AMQPError, OSError) as exc:
                 if self.stop_requested:
                     break
