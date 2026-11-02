@@ -226,9 +226,28 @@ class StorageWriteError(Exception):
 def complete_job_workflow_a(job_id: str, redis_client: Any) -> None:
     """Mark job as completed in Redis for Workflow A (store-only).
     
-    Per CONTRACT.md §5 and Task #21, updates the single field 'status'
-    without read-modify-write.
+    Per CONTRACT.md §5, Task #21, and Task #24:
+    - Updates single field 'status' to 'completed' without read-modify-write.
+    - Idempotent: if already completed, leaves it intact.
+    - Does not regress terminal failure statuses.
     """
+    current_status = redis_client.hget(f"job:{job_id}", "status")
+    if current_status == JobStatus.COMPLETED.value:
+        logger.info("Job %s is already %s (idempotent redelivery)", job_id, current_status)
+        return
+    if current_status in (
+        JobStatus.FAILED_MEASUREMENT_STORAGE.value,
+        JobStatus.FAILED_ANALYSIS.value,
+        JobStatus.FAILED_REPORT_STORAGE.value,
+    ):
+        logger.warning(
+            "Job %s is in terminal failure '%s'; skipping transition to %s",
+            job_id,
+            current_status,
+            JobStatus.COMPLETED.value,
+        )
+        return
+
     redis_client.hset(name=f"job:{job_id}", key="status", value=JobStatus.COMPLETED.value)
     logger.info("Marked job %s as %s", job_id, JobStatus.COMPLETED.value)
 
@@ -292,21 +311,48 @@ def request_analysis_workflow_b(
 ) -> dict[str, Any]:
     """Advance job to 'stored' in Redis and publish to measurement.analysis.requested.
     
-    Per CONTRACT.md §2.2, §3, §5, and Task #22:
+    Per CONTRACT.md §2.2, §3, §5, Task #22, and Task #24:
     1. Sets job status to 'stored' in Redis via single-field HSET (no read-modify-write).
-    2. Publishes {job_id, measurement_id, analysis, threshold_ms} to Queues.ANALYSIS_REQUESTED.
-    3. Uses delivery_mode=2 (Persistent) and declares queue durable.
-    4. Exactly one queue is published to (one queue in, one queue out).
+    2. Prevents status regression: a redelivery must never move a job backwards
+       (e.g. from 'analyzed' or 'completed' back to 'stored').
+    3. Prevents duplicate publishing if job has already progressed past 'stored'.
+    4. Publishes {job_id, measurement_id, analysis, threshold_ms} to Queues.ANALYSIS_REQUESTED.
+    5. Uses delivery_mode=2 (Persistent) and declares queue durable.
+    6. Exactly one queue is published to (one queue in, one queue out).
     """
-    redis_client.hset(name=f"job:{msg.job_id}", key="status", value=JobStatus.STORED.value)
-    logger.info("Marked job %s as %s", msg.job_id, JobStatus.STORED.value)
-
     payload = {
         "job_id": msg.job_id,
         "measurement_id": msg.measurement_id,
         "analysis": msg.analysis or "latency_summary",
         "threshold_ms": msg.threshold_ms if msg.threshold_ms is not None else 30,
     }
+
+    current_status = redis_client.hget(f"job:{msg.job_id}", "status") if redis_client is not None else None
+
+    # Guard against status regression and duplicate downstream dispatch on redelivery (Task #24)
+    if current_status in (
+        JobStatus.ANALYZED.value,
+        JobStatus.COMPLETED.value,
+        JobStatus.FAILED_ANALYSIS.value,
+        JobStatus.FAILED_REPORT_STORAGE.value,
+    ):
+        logger.info(
+            "Job %s has already reached '%s'; skipping regression to '%s' and duplicate publish.",
+            msg.job_id,
+            current_status,
+            JobStatus.STORED.value,
+        )
+        return payload
+
+    if current_status != JobStatus.STORED.value:
+        redis_client.hset(name=f"job:{msg.job_id}", key="status", value=JobStatus.STORED.value)
+        logger.info("Marked job %s as %s", msg.job_id, JobStatus.STORED.value)
+    else:
+        logger.info(
+            "Job %s is already %s (redelivery before downstream processing)",
+            msg.job_id,
+            current_status,
+        )
 
     if channel is not None:
         channel.queue_declare(queue=Queues.ANALYSIS_REQUESTED, durable=True)
@@ -395,6 +441,15 @@ def handle_message(
         logger.exception("Unexpected error processing storage message: %s", exc)
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
         return
+
+    # Drill hook for testing unacknowledged crash and restart (Task #24 / #54):
+    drill_job = os.getenv("DRILL_CRASH_BEFORE_ACK")
+    if drill_job and (drill_job.lower() in ("true", "1") or drill_job == msg.job_id) and not method.redelivered:
+        logger.warning(
+            "DRILL: Simulating container crash before ACK for job %s (exiting without ACK)",
+            msg.job_id,
+        )
+        os._exit(42)
 
     ch.basic_ack(delivery_tag=method.delivery_tag)
 

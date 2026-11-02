@@ -81,6 +81,9 @@ class FakeRedis:
     def hgetall(self, name: str) -> dict[str, str]:
         return dict(self._hashes.get(name, {}))
 
+    def hget(self, name: str, key: str) -> str | None:
+        return self._hashes.get(name, {}).get(key)
+
     def ping(self) -> bool:
         return True
 
@@ -753,6 +756,138 @@ def test_process_message_redis_metadata_failure_marks_job_failed(mock_s3, valid_
 
     # Status must be set to failed_measurement_storage
     assert redis_client.hgetall("job:job-001")["status"] == JobStatus.FAILED_MEASUREMENT_STORAGE.value
+
+
+# --- Task #24: Idempotent storage on redelivery tests ---
+
+
+def test_redelivery_does_not_regress_analyzed_job(mock_s3, fake_redis, valid_flat_payload):
+    valid_flat_payload["job_id"] = "job-002"
+    valid_flat_payload["measurement_id"] = "m-002"
+    valid_flat_payload["analyze"] = True
+    valid_flat_payload["analysis"] = "latency_summary"
+
+    # Job has already advanced to analyzed in downstream QoS service
+    fake_redis.hset(
+        "job:job-002",
+        mapping={"measurement_id": "m-002", "status": JobStatus.ANALYZED.value},
+    )
+
+    msg = parse_storage_message(valid_flat_payload)
+    mock_channel = MagicMock()
+
+    process_message(msg, s3_client=mock_s3, redis_client=fake_redis, channel=mock_channel)
+
+    # Must NOT regress status back to stored
+    assert fake_redis.hgetall("job:job-002")["status"] == JobStatus.ANALYZED.value
+    # Must NOT re-publish duplicate message to queue
+    mock_channel.basic_publish.assert_not_called()
+
+
+def test_redelivery_does_not_regress_completed_job(mock_s3, fake_redis, valid_flat_payload):
+    valid_flat_payload["job_id"] = "job-002"
+    valid_flat_payload["measurement_id"] = "m-002"
+    valid_flat_payload["analyze"] = True
+    valid_flat_payload["analysis"] = "latency_summary"
+
+    # Job has already reached terminal completed state
+    fake_redis.hset(
+        "job:job-002",
+        mapping={
+            "measurement_id": "m-002",
+            "status": JobStatus.COMPLETED.value,
+            "report_id": "r-002",
+        },
+    )
+
+    msg = parse_storage_message(valid_flat_payload)
+    mock_channel = MagicMock()
+
+    process_message(msg, s3_client=mock_s3, redis_client=fake_redis, channel=mock_channel)
+
+    # Must NOT regress status back to stored
+    job = fake_redis.hgetall("job:job-002")
+    assert job["status"] == JobStatus.COMPLETED.value
+    assert job["report_id"] == "r-002"
+    # Must NOT re-publish duplicate message to queue
+    mock_channel.basic_publish.assert_not_called()
+
+
+def test_redelivery_workflow_a_already_completed(fake_redis):
+    fake_redis.hset(
+        "job:job-001",
+        mapping={"measurement_id": "m-001", "status": JobStatus.COMPLETED.value},
+    )
+
+    complete_job_workflow_a("job-001", fake_redis)
+
+    assert fake_redis.hgetall("job:job-001")["status"] == JobStatus.COMPLETED.value
+
+
+def test_redelivery_leaves_single_s3_and_redis_artifacts(
+    mock_s3, fake_redis, valid_flat_payload
+):
+    msg = parse_storage_message(valid_flat_payload)
+
+    # Deliver 3 times
+    for _ in range(3):
+        process_message(msg, s3_client=mock_s3, redis_client=fake_redis)
+
+    # S3 bucket has exactly 1 object
+    response = mock_s3.list_objects_v2(Bucket=Buckets.MEASUREMENTS)
+    assert response["KeyCount"] == 1
+    assert response["Contents"][0]["Key"] == "h1-h2/m-001.json"
+
+    # Redis metadata has exactly 1 entry for this measurement
+    assert fake_redis.hgetall("meas:m-001")["status"] == "stored"
+
+
+def test_drill_crash_before_ack_hook(monkeypatch, mock_s3, fake_redis, valid_flat_payload):
+    monkeypatch.setenv("DRILL_CRASH_BEFORE_ACK", "job-001")
+    exit_called = []
+
+    def fake_exit(code):
+        exit_called.append(code)
+        raise SystemExit(code)
+
+    monkeypatch.setattr("os._exit", fake_exit)
+
+    channel = MagicMock()
+    method = MagicMock()
+    method.delivery_tag = 999
+    method.redelivered = False
+    properties = MagicMock()
+    body = json.dumps(valid_flat_payload).encode("utf-8")
+
+    # 1. First delivery crashes right before ACK
+    with pytest.raises(SystemExit):
+        handle_message(
+            channel,
+            method,
+            properties,
+            body,
+            s3_client=mock_s3,
+            redis_client=fake_redis,
+        )
+
+    assert exit_called == [42]
+    # S3 and Redis writes succeeded before crash
+    assert exists(Buckets.MEASUREMENTS, "h1-h2/m-001.json", client=mock_s3) is True
+    assert fake_redis.hgetall("meas:m-001")["status"] == "stored"
+    # Basic ACK was NOT called on channel before crash
+    channel.basic_ack.assert_not_called()
+
+    # 2. Redelivery (method.redelivered = True) restarts, finishes cleanly, and ACKs
+    method.redelivered = True
+    handle_message(
+        channel,
+        method,
+        properties,
+        body,
+        s3_client=mock_s3,
+        redis_client=fake_redis,
+    )
+    channel.basic_ack.assert_called_once_with(delivery_tag=999)
 
 
 # --- Consumer callback & lifecycle tests ---
