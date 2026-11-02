@@ -28,6 +28,9 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from api_gateway.models import AnalyzeStoredIn, MeasurementIn, SubmitAnalyzeIn
+from api_gateway.config import Settings, load_settings
+from api_gateway.publisher import PublishError, Publisher
+from api_gateway.store import JobStore, JobStoreError, create_redis_client
 
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -74,6 +77,36 @@ async def http_exception_handler(
     request: Request, exc: StarletteHTTPException
 ) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+
+
+@app.exception_handler(PublishError)
+async def publish_error_handler(request: Request, exc: PublishError) -> JSONResponse:
+    logger.exception("Message broker unavailable", exc_info=exc)
+    return JSONResponse(status_code=503, content={"error": "message broker unavailable"})
+
+
+@app.exception_handler(JobStoreError)
+async def job_store_error_handler(request: Request, exc: JobStoreError) -> JSONResponse:
+    logger.exception("Job store unavailable", exc_info=exc)
+    return JSONResponse(status_code=503, content={"error": "job store unavailable"})
+
+
+def get_settings(request: Request) -> Settings:
+    if not hasattr(request.app.state, "settings"):
+        request.app.state.settings = load_settings()
+    return request.app.state.settings
+
+
+def get_job_store(request: Request) -> JobStore:
+    if not hasattr(request.app.state, "job_store"):
+        request.app.state.job_store = JobStore(create_redis_client(get_settings(request)))
+    return request.app.state.job_store
+
+
+def get_publisher(request: Request) -> Publisher:
+    if not hasattr(request.app.state, "publisher"):
+        request.app.state.publisher = Publisher(get_settings(request))
+    return request.app.state.publisher
 
 
 @app.post("/measurements", status_code=202)
