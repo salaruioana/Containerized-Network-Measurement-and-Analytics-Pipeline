@@ -24,6 +24,7 @@ from typing import Any
 import pika
 import pika.adapters.blocking_connection
 import pika.exceptions
+import redis
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from aic_common.contract import (
@@ -189,6 +190,33 @@ def store_raw_measurement(msg: StorageMessage, s3_client: Any = None) -> str:
     return key
 
 
+def store_measurement_metadata(msg: StorageMessage, redis_client: Any) -> dict[str, str]:
+    """Store measurement metadata hash in Redis at meas:<measurement_id>.
+    
+    Storage Service is the sole writer of measurement metadata.
+    Fields match CONTRACT.md §2.1 and §2.2:
+      measurement_id, source_host, target_host, metric, timestamp, object_path, status='stored'.
+    """
+    obj_path = measurement_object_path(msg.source_host, msg.target_host, msg.measurement_id)
+    metadata = {
+        "measurement_id": msg.measurement_id,
+        "source_host": msg.source_host,
+        "target_host": msg.target_host,
+        "metric": msg.metric,
+        "timestamp": msg.timestamp or "",
+        "object_path": obj_path,
+        "status": "stored",
+    }
+    redis_client.hset(name=f"meas:{msg.measurement_id}", mapping=metadata)
+    logger.info(
+        "Saved metadata in Redis for %s at meas:%s (job %s)",
+        msg.measurement_id,
+        msg.measurement_id,
+        msg.job_id,
+    )
+    return metadata
+
+
 def process_message(
     msg: StorageMessage,
     s3_client: Any = None,
@@ -202,6 +230,8 @@ def process_message(
     """
     logger.info("Consumed storage job %s for measurement %s", msg.job_id, msg.measurement_id)
     store_raw_measurement(msg, s3_client=s3_client)
+    if redis_client is not None:
+        store_measurement_metadata(msg, redis_client=redis_client)
 
 
 def handle_message(
@@ -271,6 +301,37 @@ def connect_rabbitmq(
             time.sleep(retry_interval)
 
 
+def connect_redis(
+    host: str | None = None,
+    port: int | None = None,
+    retry_interval: float = 5.0,
+) -> redis.Redis:
+    """Connect to Redis, retrying while the service is unavailable."""
+    host = host or os.getenv("REDIS_HOST", "redis")
+    port = port or int(os.getenv("REDIS_PORT", "6379"))
+
+    client = redis.Redis(
+        host=host,
+        port=port,
+        decode_responses=True,
+    )
+
+    while True:
+        try:
+            client.ping()
+            logger.info("Connected to Redis at %s:%s", host, port)
+            return client
+        except (redis.RedisError, OSError) as exc:
+            logger.warning(
+                "Redis at %s:%s unavailable (%s). Retrying in %.0f seconds...",
+                host,
+                port,
+                exc,
+                retry_interval,
+            )
+            time.sleep(retry_interval)
+
+
 class ConsumerContext:
     """Manages consumer connection and graceful shutdown state."""
 
@@ -304,6 +365,7 @@ def main() -> None:
 
     logger.info("Starting %s...", SERVICE_NAME)
     s3_client = get_s3_client()
+    redis_client = connect_redis()
 
     while not context.stop_requested:
         try:
@@ -322,7 +384,14 @@ def main() -> None:
             channel.basic_qos(prefetch_count=1)
 
             def callback(ch, method, properties, body):
-                handle_message(ch, method, properties, body, s3_client=s3_client)
+                handle_message(
+                    ch,
+                    method,
+                    properties,
+                    body,
+                    s3_client=s3_client,
+                    redis_client=redis_client,
+                )
 
             channel.basic_consume(
                 queue=Queues.MEASUREMENT_CREATED,

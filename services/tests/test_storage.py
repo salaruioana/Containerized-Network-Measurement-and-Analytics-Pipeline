@@ -22,6 +22,7 @@ from storage_service.main import (
     handle_message,
     parse_storage_message,
     process_message,
+    store_measurement_metadata,
     store_raw_measurement,
 )
 
@@ -44,6 +45,35 @@ def mock_s3():
         client = boto3.client("s3", region_name="us-east-1")
         client.create_bucket(Bucket=Buckets.MEASUREMENTS)
         yield client
+
+
+class FakeRedis:
+    """In-memory Redis fake for metadata hash testing."""
+
+    def __init__(self) -> None:
+        self._hashes: dict[str, dict[str, str]] = {}
+
+    def hset(self, name: str, mapping: dict[str, Any] | None = None, **kwargs) -> int:
+        if name not in self._hashes:
+            self._hashes[name] = {}
+        merged: dict[str, str] = {}
+        if mapping:
+            merged.update({str(k): str(v) for k, v in mapping.items()})
+        if kwargs:
+            merged.update({str(k): str(v) for k, v in kwargs.items()})
+        self._hashes[name].update(merged)
+        return len(merged)
+
+    def hgetall(self, name: str) -> dict[str, str]:
+        return dict(self._hashes.get(name, {}))
+
+    def ping(self) -> bool:
+        return True
+
+
+@pytest.fixture
+def fake_redis() -> FakeRedis:
+    return FakeRedis()
 
 
 @pytest.fixture
@@ -244,21 +274,77 @@ def test_process_message_stores_raw_measurement(mock_s3, valid_flat_payload):
     assert exists(Buckets.MEASUREMENTS, expected_key, client=mock_s3) is True
 
 
+# --- Task #20: Measurement metadata in Redis tests ---
+
+
+def test_store_measurement_metadata_success(fake_redis, valid_flat_payload):
+    msg = parse_storage_message(valid_flat_payload)
+    meta = store_measurement_metadata(msg, redis_client=fake_redis)
+
+    expected = {
+        "measurement_id": "m-001",
+        "source_host": "h1",
+        "target_host": "h2",
+        "metric": "latency",
+        "timestamp": "2026-06-22T10:00:00Z",
+        "object_path": "measurements/h1-h2/m-001.json",
+        "status": "stored",
+    }
+    assert meta == expected
+    assert fake_redis.hgetall("meas:m-001") == expected
+
+
+def test_store_measurement_metadata_idempotent_redelivery(fake_redis, valid_flat_payload):
+    msg = parse_storage_message(valid_flat_payload)
+
+    # First write
+    store_measurement_metadata(msg, redis_client=fake_redis)
+    # Second write (simulated redelivery)
+    store_measurement_metadata(msg, redis_client=fake_redis)
+
+    stored = fake_redis.hgetall("meas:m-001")
+    assert len(stored) == 7
+    assert stored["measurement_id"] == "m-001"
+    assert stored["status"] == "stored"
+
+
+def test_process_message_stores_s3_and_redis(mock_s3, fake_redis, valid_flat_payload):
+    msg = parse_storage_message(valid_flat_payload)
+    process_message(msg, s3_client=mock_s3, redis_client=fake_redis)
+
+    # Verify S3
+    assert exists(Buckets.MEASUREMENTS, "h1-h2/m-001.json", client=mock_s3) is True
+
+    # Verify Redis
+    redis_meta = fake_redis.hgetall("meas:m-001")
+    assert redis_meta["measurement_id"] == "m-001"
+    assert redis_meta["object_path"] == "measurements/h1-h2/m-001.json"
+    assert redis_meta["status"] == "stored"
+
+
 # --- Consumer callback & lifecycle tests ---
 
 
-def test_handle_message_ack_on_success(mock_s3, valid_flat_payload):
+def test_handle_message_ack_on_success(mock_s3, fake_redis, valid_flat_payload):
     channel = MagicMock()
     method = MagicMock()
     method.delivery_tag = 42
     properties = MagicMock()
     body = json.dumps(valid_flat_payload).encode("utf-8")
 
-    handle_message(channel, method, properties, body, s3_client=mock_s3)
+    handle_message(
+        channel,
+        method,
+        properties,
+        body,
+        s3_client=mock_s3,
+        redis_client=fake_redis,
+    )
 
     channel.basic_ack.assert_called_once_with(delivery_tag=42)
     channel.basic_nack.assert_not_called()
     assert exists(Buckets.MEASUREMENTS, "h1-h2/m-001.json", client=mock_s3) is True
+    assert fake_redis.hgetall("meas:m-001")["status"] == "stored"
 
 
 def test_handle_message_nack_no_requeue_on_malformed_json(mock_s3):
