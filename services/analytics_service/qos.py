@@ -10,6 +10,7 @@ implement must be correct.
 """
 
 from __future__ import annotations
+from decimal import Decimal, ROUND_HALF_UP
 
 from aic_common.contract import AnalyticsResult
 
@@ -20,6 +21,10 @@ LOSS_ANOMALY_PERCENT = 5.0
 NOMINAL_HEADROOM_RATIO = 0.6
 # Metrics measured in milliseconds and judged against threshold_ms.
 DELAY_METRICS = ("latency", "jitter")
+# Every metric we can analyse; anything else fails the analysis.
+METRICS = ("latency", "jitter", "throughput")
+# Unit per metric, used when the client did not send one.
+DEFAULT_UNITS = {"latency": "ms", "jitter": "ms", "throughput": "mbps"}
 
 
 def round_half_up(value: float, digits: int = 1) -> float:
@@ -31,7 +36,9 @@ def round_half_up(value: float, digits: int = 1) -> float:
 
     Note: `round(17.45, 1)` in Python gives 17.4, not 17.5.
     """
-    raise NotImplementedError("qos.round_half_up")
+    d = Decimal(str(value))
+    step = Decimal(1).scaleb(-digits)
+    return float(d.quantize(step, rounding=ROUND_HALF_UP))
 
 
 def average(values: list[float]) -> float:
@@ -40,7 +47,7 @@ def average(values: list[float]) -> float:
     :param values: at least 1 sample.
     :return: the mean, rounded to 1 decimal.
     """
-    raise NotImplementedError("qos.average")
+    return round_half_up(sum(values) / len(values), 1)
 
 
 def jitter(values: list[float]) -> float:
@@ -54,7 +61,10 @@ def jitter(values: list[float]) -> float:
     the second drifts once. A call stutters when the delay changes between 2
     packets, not when the average is high. Decide what 1 sample gives you.
     """
-    raise NotImplementedError("qos.jitter")
+    if len(values) < 2:
+        return 0.0
+    diffs = [abs(cur - prev) for prev, cur in zip(values, values[1:])]
+    return round_half_up(sum(diffs) / len(diffs), 1)
 
 
 def packet_loss_percent(sent: int | None, received: int | None) -> float | None:
@@ -68,7 +78,11 @@ def packet_loss_percent(sent: int | None, received: int | None) -> float | None:
     A missing count is not zero loss: "we do not know" and "none was lost" are
     different claims. More received than sent is 0.0, never a negative number.
     """
-    raise NotImplementedError("qos.packet_loss_percent")
+    if sent is None or received is None or sent <= 0:
+        return None
+    lost = sent - min(received, sent)
+    # Round to 1 decimal for consistency with the other indicators.
+    return round_half_up(lost / sent * 100, 1)
 
 
 def resolve_metric(analysis: str | None, metric: str | None) -> str:
@@ -78,7 +92,15 @@ def resolve_metric(analysis: str | None, metric: str | None) -> str:
     :param metric: the metric of the measurement, used as the fallback.
     :return: the metric name, for example `latency`.
     """
-    raise NotImplementedError("qos.resolve_metric")
+    if analysis:
+        name = analysis.removesuffix("_summary")
+    elif metric:
+        name = metric
+    else:
+        name = "latency"
+    if name not in METRICS:
+        raise ValueError(f"unknown metric: {name}")
+    return name
 
 
 def classify(metric: str, mean: float | None, threshold_ms: float,
@@ -94,7 +116,17 @@ def classify(metric: str, mean: float | None, threshold_ms: float,
 
     Loss has a stricter rule than delay: any loss at all rules out `nominal`.
     """
-    raise NotImplementedError("qos.classify")
+    if anomaly:
+        return "critical"
+    has_loss = loss is not None and loss > 0
+    if metric in DELAY_METRICS:
+        limit = round_half_up(NOMINAL_HEADROOM_RATIO * threshold_ms, 2)
+        comfortable = mean is not None and mean <= limit
+    else:
+        comfortable = True
+    if comfortable and not has_loss:
+        return "nominal"
+    return "degraded"
 
 
 def analyze(measurement_id: str, analysis: str | None, metric: str | None,
@@ -114,4 +146,40 @@ def analyze(measurement_id: str, analysis: str | None, metric: str | None,
     :return: the result, with the fields of the resolved metric filled in and
         the others left None.
     """
-    raise NotImplementedError("qos.analyze")
+    if not values:
+        raise ValueError("no samples")
+    resolved = resolve_metric(analysis, metric)
+    threshold = DEFAULT_THRESHOLD_MS if threshold_ms is None else threshold_ms
+    loss = packet_loss_percent(packets_sent, packets_received)
+    mean = average(values)
+
+    fields: dict = {
+        "measurement_id": measurement_id,
+        "metric": resolved,
+        "unit": unit or DEFAULT_UNITS[resolved],
+        "sample_count": len(values),
+        "packet_loss_percent": loss,
+    }
+
+    if resolved == "latency":
+        fields["average_latency_ms"] = mean
+        fields["min_latency_ms"] = int(round_half_up(min(values), 0))
+        fields["max_latency_ms"] = int(round_half_up(max(values), 0))
+        fields["jitter_ms"] = jitter(values)
+    elif resolved == "jitter":
+        fields["jitter_ms"] = mean
+    else:
+        fields["throughput_avg_mbps"] = mean
+        fields["throughput_min_mbps"] = round_half_up(min(values), 1)
+        fields["throughput_max_mbps"] = round_half_up(max(values), 1)
+
+    delay_breach = False
+    if resolved in DELAY_METRICS:
+        fields["threshold_ms"] = threshold
+        delay_breach = max(values) > threshold
+    loss_breach = loss is not None and loss > LOSS_ANOMALY_PERCENT
+
+    anomaly = delay_breach or loss_breach
+    fields["anomaly_detected"] = anomaly
+    fields["quality"] = classify(resolved, mean, threshold, loss, anomaly)
+    return AnalyticsResult(**fields)
