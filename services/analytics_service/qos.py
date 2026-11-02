@@ -10,6 +10,7 @@ implement must be correct.
 """
 
 from __future__ import annotations
+from decimal import Decimal, ROUND_HALF_UP
 
 from aic_common.contract import AnalyticsResult
 
@@ -31,7 +32,9 @@ def round_half_up(value: float, digits: int = 1) -> float:
 
     Note: `round(17.45, 1)` in Python gives 17.4, not 17.5.
     """
-    raise NotImplementedError("qos.round_half_up")
+    d = Decimal(str(value))
+    step = Decimal(1).scaleb(-digits)
+    return float(d.quantize(step, rounding=ROUND_HALF_UP))
 
 
 def average(values: list[float]) -> float:
@@ -40,7 +43,7 @@ def average(values: list[float]) -> float:
     :param values: at least 1 sample.
     :return: the mean, rounded to 1 decimal.
     """
-    raise NotImplementedError("qos.average")
+    return round_half_up(sum(values) / len(values), 1)
 
 
 def jitter(values: list[float]) -> float:
@@ -54,7 +57,10 @@ def jitter(values: list[float]) -> float:
     the second drifts once. A call stutters when the delay changes between 2
     packets, not when the average is high. Decide what 1 sample gives you.
     """
-    raise NotImplementedError("qos.jitter")
+    if len(values) < 2:
+        return 0.0
+    diffs = [abs(cur - prev) for prev, cur in zip(values, values[1:])]
+    return round_half_up(sum(diffs) / len(diffs), 1)
 
 
 def packet_loss_percent(sent: int | None, received: int | None) -> float | None:
@@ -68,7 +74,6 @@ def packet_loss_percent(sent: int | None, received: int | None) -> float | None:
     A missing count is not zero loss: "we do not know" and "none was lost" are
     different claims. More received than sent is 0.0, never a negative number.
     """
-    raise NotImplementedError("qos.packet_loss_percent")
 
 
 def resolve_metric(analysis: str | None, metric: str | None) -> str:
