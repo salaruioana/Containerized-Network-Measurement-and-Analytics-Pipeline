@@ -144,3 +144,79 @@ class TestMetricMapping:
     @pytest.mark.parametrize("unit", ["ms", "s"])
     def test_a_supplied_unit_wins_over_the_default(self, unit):
         assert analyze([10], unit=unit).unit == unit
+
+# --- Our edge cases See Task(#29), beyond the supplied tests above ---
+
+def dumped(result):
+    """The result as it goes on the queue: None fields dropped."""
+    return result.model_dump(exclude_none=True)
+
+
+class TestSingleSample:
+    def test_one_sample_has_zero_jitter_and_equal_bounds(self):
+        result = analyze([12])
+        assert result.sample_count == 1
+        assert result.jitter_ms == 0.0
+        assert result.min_latency_ms == result.max_latency_ms == 12
+        assert result.average_latency_ms == 12.0
+
+
+class TestMissingPacketCounts:
+    @pytest.mark.parametrize("sent, received", [(10, None), (None, 10), (None, None)])
+    def test_no_loss_field_without_both_counts(self, sent, received):
+        result = analyze([10, 11], packets_sent=sent, packets_received=received)
+        assert "packet_loss_percent" not in dumped(result)
+
+    def test_unknown_loss_does_not_block_nominal(self):
+        assert analyze([10, 10], threshold_ms=30).quality == "nominal"
+
+
+class TestMoreReceivedThanSent:
+    def test_loss_is_zero_and_still_nominal(self):
+        result = analyze([10, 10], packets_sent=10, packets_received=12)
+        assert result.packet_loss_percent == 0.0
+        assert result.anomaly_detected is False
+        assert result.quality == "nominal"
+
+
+class TestThresholdBoundaries:
+    def test_max_equal_to_threshold_is_no_anomaly(self):
+        result = analyze([5, 25], threshold_ms=25)
+        assert result.anomaly_detected is False
+
+    def test_just_above_threshold_is_an_anomaly(self):
+        assert analyze([5, 25.1], threshold_ms=25).anomaly_detected is True
+
+    @pytest.mark.parametrize("threshold, average", [(50, 30), (3, 1.8)])
+    def test_average_exactly_sixty_percent_is_nominal(self, threshold, average):
+        result = analyze([average, average], threshold_ms=threshold)
+        assert result.average_latency_ms == average
+        assert result.quality == "nominal"
+
+
+class TestLossBoundary:
+    def test_exactly_five_percent_is_no_anomaly_but_degraded(self):
+        result = analyze([10, 10], threshold_ms=30, packets_sent=100, packets_received=95)
+        assert result.packet_loss_percent == 5.0
+        assert result.anomaly_detected is False
+        assert result.quality == "degraded"
+
+
+class TestDefaultThreshold:
+    def test_missing_threshold_falls_back_to_thirty(self):
+        result = analyze([10, 30])
+        assert result.threshold_ms == 30
+        assert result.anomaly_detected is False
+
+    def test_default_threshold_still_catches_a_spike(self):
+        assert analyze([10, 31]).anomaly_detected is True
+
+
+class TestInvalidInput:
+    def test_no_samples_raises(self):
+        with pytest.raises(ValueError):
+            analyze([])
+
+    def test_unknown_metric_raises(self):
+        with pytest.raises(ValueError):
+            analyze([10], analysis="foo_summary")
