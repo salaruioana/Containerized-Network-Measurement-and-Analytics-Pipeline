@@ -30,6 +30,7 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from aic_common.contract import (
     Buckets,
     JOB_PREFIX,
+    JobStatus,
     MEASUREMENT_PREFIX,
     Queues,
 )
@@ -217,6 +218,16 @@ def store_measurement_metadata(msg: StorageMessage, redis_client: Any) -> dict[s
     return metadata
 
 
+def complete_job_workflow_a(job_id: str, redis_client: Any) -> None:
+    """Mark job as completed in Redis for Workflow A (store-only).
+    
+    Per CONTRACT.md §5 and Task #21, updates the single field 'status'
+    without read-modify-write.
+    """
+    redis_client.hset(name=f"job:{job_id}", key="status", value=JobStatus.COMPLETED.value)
+    logger.info("Marked job %s as %s", job_id, JobStatus.COMPLETED.value)
+
+
 def process_message(
     msg: StorageMessage,
     s3_client: Any = None,
@@ -232,6 +243,8 @@ def process_message(
     store_raw_measurement(msg, s3_client=s3_client)
     if redis_client is not None:
         store_measurement_metadata(msg, redis_client=redis_client)
+        if not msg.analyze:
+            complete_job_workflow_a(msg.job_id, redis_client=redis_client)
 
 
 def handle_message(

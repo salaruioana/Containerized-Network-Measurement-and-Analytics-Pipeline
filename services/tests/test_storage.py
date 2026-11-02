@@ -13,12 +13,13 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from aic_common.contract import Buckets, Queues
+from aic_common.contract import Buckets, JobStatus, Queues
 from aic_common.s3 import exists, get_json
 from storage_service.main import (
     ConsumerContext,
     StorageMessage,
     build_raw_measurement_document,
+    complete_job_workflow_a,
     handle_message,
     parse_storage_message,
     process_message,
@@ -53,10 +54,19 @@ class FakeRedis:
     def __init__(self) -> None:
         self._hashes: dict[str, dict[str, str]] = {}
 
-    def hset(self, name: str, mapping: dict[str, Any] | None = None, **kwargs) -> int:
+    def hset(
+        self,
+        name: str,
+        key: str | None = None,
+        value: Any = None,
+        mapping: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> int:
         if name not in self._hashes:
             self._hashes[name] = {}
         merged: dict[str, str] = {}
+        if key is not None and value is not None:
+            merged[str(key)] = str(value)
         if mapping:
             merged.update({str(k): str(v) for k, v in mapping.items()})
         if kwargs:
@@ -320,6 +330,114 @@ def test_process_message_stores_s3_and_redis(mock_s3, fake_redis, valid_flat_pay
     assert redis_meta["measurement_id"] == "m-001"
     assert redis_meta["object_path"] == "measurements/h1-h2/m-001.json"
     assert redis_meta["status"] == "stored"
+
+    # Verify Job is marked completed for Workflow A
+    job = fake_redis.hgetall("job:job-001")
+    assert job["status"] == "completed"
+
+
+# --- Task #21: Workflow A: mark the job completed tests ---
+
+
+def test_complete_job_workflow_a_single_field_update(fake_redis):
+    # Seed job created by Gateway in queued state with measurement_id
+    fake_redis.hset(
+        "job:job-001",
+        mapping={"measurement_id": "m-001", "status": JobStatus.QUEUED.value},
+    )
+
+    complete_job_workflow_a("job-001", fake_redis)
+
+    job = fake_redis.hgetall("job:job-001")
+    assert job["status"] == JobStatus.COMPLETED.value
+    # Confirm single-field update: measurement_id preserved, report_id not added
+    assert job["measurement_id"] == "m-001"
+    assert "report_id" not in job
+
+
+def test_process_message_workflow_a_completes_job(mock_s3, fake_redis, valid_flat_payload):
+    fake_redis.hset(
+        "job:job-001",
+        mapping={"measurement_id": "m-001", "status": JobStatus.QUEUED.value},
+    )
+    msg = parse_storage_message(valid_flat_payload)
+    assert msg.analyze is False
+
+    process_message(msg, s3_client=mock_s3, redis_client=fake_redis)
+
+    # 1. S3 raw measurement written
+    assert exists(Buckets.MEASUREMENTS, "h1-h2/m-001.json", client=mock_s3) is True
+    # 2. Redis metadata written
+    assert fake_redis.hgetall("meas:m-001")["status"] == "stored"
+    # 3. Redis job status set to completed
+    job = fake_redis.hgetall("job:job-001")
+    assert job["status"] == JobStatus.COMPLETED.value
+    assert job["measurement_id"] == "m-001"
+
+
+def test_process_message_workflow_b_does_not_mark_completed(
+    mock_s3, fake_redis, valid_flat_payload
+):
+    valid_flat_payload["analyze"] = True
+    valid_flat_payload["analysis"] = "latency_summary"
+    msg = parse_storage_message(valid_flat_payload)
+    assert msg.analyze is True
+
+    fake_redis.hset(
+        "job:job-001",
+        mapping={"measurement_id": "m-001", "status": JobStatus.QUEUED.value},
+    )
+
+    process_message(msg, s3_client=mock_s3, redis_client=fake_redis)
+
+    # Storage writes S3 and metadata, but does NOT mark completed (Workflow B is queued/stored)
+    job = fake_redis.hgetall("job:job-001")
+    assert job.get("status") != JobStatus.COMPLETED.value
+
+
+def test_complete_job_workflow_a_idempotent_redelivery(fake_redis):
+    fake_redis.hset(
+        "job:job-001",
+        mapping={"measurement_id": "m-001", "status": JobStatus.QUEUED.value},
+    )
+
+    # First delivery
+    complete_job_workflow_a("job-001", fake_redis)
+    assert fake_redis.hgetall("job:job-001")["status"] == JobStatus.COMPLETED.value
+
+    # Second delivery (redelivery)
+    complete_job_workflow_a("job-001", fake_redis)
+    job = fake_redis.hgetall("job:job-001")
+    assert job["status"] == JobStatus.COMPLETED.value
+    assert job["measurement_id"] == "m-001"
+
+
+def test_handle_message_workflow_a_completes_job_and_acks(
+    mock_s3, fake_redis, valid_flat_payload
+):
+    fake_redis.hset(
+        "job:job-001",
+        mapping={"measurement_id": "m-001", "status": JobStatus.QUEUED.value},
+    )
+
+    channel = MagicMock()
+    method = MagicMock()
+    method.delivery_tag = 77
+    properties = MagicMock()
+    body = json.dumps(valid_flat_payload).encode("utf-8")
+
+    handle_message(
+        channel,
+        method,
+        properties,
+        body,
+        s3_client=mock_s3,
+        redis_client=fake_redis,
+    )
+
+    channel.basic_ack.assert_called_once_with(delivery_tag=77)
+    channel.basic_nack.assert_not_called()
+    assert fake_redis.hgetall("job:job-001")["status"] == JobStatus.COMPLETED.value
 
 
 # --- Consumer callback & lifecycle tests ---
