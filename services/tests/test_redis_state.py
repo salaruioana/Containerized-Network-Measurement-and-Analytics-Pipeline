@@ -31,14 +31,22 @@ def test_valid_workflow_b_transitions(job):
     assert get_job(job, "job-001")["status"] == "completed"
 
 
-def test_valid_workflow_a_transition(job):
-    assert set_job_status(job, "job-001", JobStatus.STORED) is True
-    assert set_job_status(job, "job-001", JobStatus.COMPLETED) is True
+def test_valid_workflow_a_transition(client):
+    create_job(client, "job-a", "m-001")
+    assert set_job_status(client, "job-a", JobStatus.COMPLETED) is True
+    assert get_job(client, "job-a")["status"] == "completed"
+
+
+def test_valid_workflow_c_transitions(client):
+    create_job(client, "job-c", "m-001")
+    assert set_job_status(client, "job-c", JobStatus.ANALYZED) is True
+    assert set_job_status(client, "job-c", JobStatus.COMPLETED) is True
+    assert get_job(client, "job-c")["status"] == "completed"
 
 
 def test_invalid_transition_is_rejected(job):
     with pytest.raises(InvalidJobTransition):
-        set_job_status(job, "job-001", JobStatus.COMPLETED)
+        set_job_status(job, "job-001", JobStatus.FAILED_REPORT_STORAGE)
 
 
 def test_completed_job_cannot_regress(job):

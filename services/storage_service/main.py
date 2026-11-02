@@ -36,6 +36,13 @@ from aic_common.contract import (
     Queues,
 )
 from aic_common.rabbitmq import RabbitMQConsumer
+from aic_common.redis_state import (
+    InvalidJobTransition,
+    RedisStateError,
+    create_job,
+    set_job_status,
+    set_measurement_meta,
+)
 from aic_common.s3 import (
     get_s3_client,
     measurement_key,
@@ -260,7 +267,7 @@ def store_measurement_metadata(msg: StorageMessage, redis_client: Any) -> dict[s
         "object_path": obj_path,
         "status": "stored",
     }
-    redis_client.hset(name=f"meas:{msg.measurement_id}", mapping=metadata)
+    set_measurement_meta(redis_client, msg.measurement_id, metadata)
     logger.info(
         "Saved metadata in Redis for %s at meas:%s (job %s)",
         msg.measurement_id,
@@ -275,32 +282,37 @@ class StorageWriteError(Exception):
     pass
 
 
-def complete_job_workflow_a(job_id: str, redis_client: Any) -> None:
+def complete_job_workflow_a(
+    job_id: str, redis_client: Any, measurement_id: str | None = None
+) -> None:
     """Mark job as completed in Redis for Workflow A (store-only).
     
     Per CONTRACT.md §5, Task #21, and Task #24:
+    - Uses set_job_status from aic_common.redis_state.
     - Updates single field 'status' to 'completed' without read-modify-write.
     - Idempotent: if already completed, leaves it intact.
     - Does not regress terminal failure statuses.
     """
-    current_status = redis_client.hget(f"job:{job_id}", "status")
-    if current_status == JobStatus.COMPLETED.value:
-        logger.info("Job %s is already %s (idempotent redelivery)", job_id, current_status)
-        return
-    if current_status in (
-        JobStatus.FAILED_ANALYSIS.value,
-        JobStatus.FAILED_REPORT_STORAGE.value,
-    ):
+    try:
+        changed = set_job_status(redis_client, job_id, JobStatus.COMPLETED)
+        if changed:
+            logger.info("Marked job %s as %s", job_id, JobStatus.COMPLETED.value)
+        else:
+            logger.info("Job %s is already %s (idempotent redelivery)", job_id, JobStatus.COMPLETED.value)
+    except InvalidJobTransition as exc:
         logger.warning(
-            "Job %s is in terminal downstream failure '%s'; skipping transition to %s",
+            "Job %s is in terminal downstream failure; skipping transition to %s: %s",
             job_id,
-            current_status,
             JobStatus.COMPLETED.value,
+            exc,
         )
-        return
-
-    redis_client.hset(name=f"job:{job_id}", key="status", value=JobStatus.COMPLETED.value)
-    logger.info("Marked job %s as %s", job_id, JobStatus.COMPLETED.value)
+    except RedisStateError as exc:
+        logger.warning("Job %s does not exist in Redis; initializing job: %s", job_id, exc)
+        if measurement_id:
+            create_job(redis_client, job_id, measurement_id)
+        else:
+            redis_client.hset(name=f"job:{job_id}", mapping={"status": JobStatus.QUEUED.value})
+        set_job_status(redis_client, job_id, JobStatus.COMPLETED)
 
 
 def handle_storage_failure(
@@ -320,10 +332,10 @@ def handle_storage_failure(
     logger.error("Failed measurement storage for job %s: %s", job_id, exc)
     if redis_client is not None:
         try:
-            redis_client.hset(
-                name=f"job:{job_id}",
-                key="status",
-                value=JobStatus.FAILED_MEASUREMENT_STORAGE.value,
+            set_job_status(
+                redis_client,
+                job_id,
+                JobStatus.FAILED_MEASUREMENT_STORAGE,
             )
             logger.info(
                 "Marked job %s as %s", job_id, JobStatus.FAILED_MEASUREMENT_STORAGE.value
@@ -379,32 +391,29 @@ def request_analysis_workflow_b(
     if msg.threshold_ms is not None:
         payload["threshold_ms"] = msg.threshold_ms
 
-    current_status = redis_client.hget(f"job:{msg.job_id}", "status") if redis_client is not None else None
-
-    # Guard against status regression and duplicate downstream dispatch on redelivery (Task #24)
-    if current_status in (
-        JobStatus.ANALYZED.value,
-        JobStatus.COMPLETED.value,
-        JobStatus.FAILED_ANALYSIS.value,
-        JobStatus.FAILED_REPORT_STORAGE.value,
-    ):
-        logger.info(
-            "Job %s has already reached '%s'; skipping regression to '%s' and duplicate publish.",
-            msg.job_id,
-            current_status,
-            JobStatus.STORED.value,
-        )
-        return payload
-
-    if current_status != JobStatus.STORED.value:
-        redis_client.hset(name=f"job:{msg.job_id}", key="status", value=JobStatus.STORED.value)
-        logger.info("Marked job %s as %s", msg.job_id, JobStatus.STORED.value)
-    else:
-        logger.info(
-            "Job %s is already %s (redelivery before downstream processing)",
-            msg.job_id,
-            current_status,
-        )
+    if redis_client is not None:
+        try:
+            changed = set_job_status(redis_client, msg.job_id, JobStatus.STORED)
+            if changed:
+                logger.info("Marked job %s as %s", msg.job_id, JobStatus.STORED.value)
+            else:
+                logger.info(
+                    "Job %s is already %s (redelivery before downstream processing)",
+                    msg.job_id,
+                    JobStatus.STORED.value,
+                )
+        except InvalidJobTransition as exc:
+            # Guard against status regression and duplicate downstream dispatch on redelivery (Task #24)
+            logger.info(
+                "Job %s has already reached a downstream state; skipping regression to '%s' and duplicate publish.",
+                msg.job_id,
+                JobStatus.STORED.value,
+            )
+            return payload
+        except RedisStateError as exc:
+            logger.warning("Job %s does not exist in Redis; initializing job: %s", msg.job_id, exc)
+            create_job(redis_client, msg.job_id, msg.measurement_id)
+            set_job_status(redis_client, msg.job_id, JobStatus.STORED)
 
     if channel is not None:
         channel.queue_declare(queue=Queues.ANALYSIS_REQUESTED, durable=True)
@@ -457,7 +466,9 @@ def process_message(
 
     if redis_client is not None:
         if not msg.analyze:
-            complete_job_workflow_a(msg.job_id, redis_client=redis_client)
+            complete_job_workflow_a(
+                msg.job_id, redis_client=redis_client, measurement_id=msg.measurement_id
+            )
         else:
             request_analysis_workflow_b(msg, redis_client=redis_client, channel=channel)
 

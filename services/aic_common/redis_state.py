@@ -19,17 +19,20 @@ ALLOWED_TRANSITIONS = {
         JobStatus.QUEUED,
     },
     JobStatus.ANALYZED: {
-        JobStatus.STORED,
+        JobStatus.QUEUED,    # Workflow C
+        JobStatus.STORED,    # Workflow B
     },
     JobStatus.COMPLETED: {
-        JobStatus.STORED,    # Workflow A
-        JobStatus.ANALYZED,  # Workflow B
+        JobStatus.QUEUED,    # Workflow A
+        JobStatus.STORED,    # (if stored first)
+        JobStatus.ANALYZED,  # Workflow B & C
     },
     JobStatus.FAILED_MEASUREMENT_STORAGE: {
         JobStatus.QUEUED,
     },
     JobStatus.FAILED_ANALYSIS: {
-        JobStatus.STORED,
+        JobStatus.QUEUED,    # Workflow C
+        JobStatus.STORED,    # Workflow B
     },
     JobStatus.FAILED_REPORT_STORAGE: {
         JobStatus.ANALYZED,
@@ -132,13 +135,25 @@ def set_job_status(client, job_id, new_status: JobStatus) -> bool:
     allowed_previous = ALLOWED_TRANSITIONS[new_status]
 
     try:
-        result = client.eval(
-            _TRANSITION_SCRIPT,
-            1,
-            key,
-            new_status.value,
-            *[status.value for status in allowed_previous],
-        )
+        if hasattr(client, "eval"):
+            result = client.eval(
+                _TRANSITION_SCRIPT,
+                1,
+                key,
+                new_status.value,
+                *[status.value for status in allowed_previous],
+            )
+        else:
+            current = client.hget(key, "status")
+            if not current:
+                result = -1
+            elif current == new_status.value:
+                result = 0
+            elif current in [status.value for status in allowed_previous]:
+                client.hset(key, "status", new_status.value)
+                result = 1
+            else:
+                result = -2
     except redis.RedisError as exc:
         raise RedisStateError(
             f"Could not update status for job {job_id}"

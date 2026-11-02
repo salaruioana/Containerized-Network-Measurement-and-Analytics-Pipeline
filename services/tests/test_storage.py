@@ -86,6 +86,20 @@ class FakeRedis:
     def hget(self, name: str, key: str) -> str | None:
         return self._hashes.get(name, {}).get(key)
 
+    def eval(self, script: str, numkeys: int, *args) -> int:
+        key = args[0]
+        new_status = args[1]
+        allowed_previous = args[2:]
+        current = self.hget(key, "status")
+        if not current:
+            return -1
+        if current == new_status:
+            return 0
+        if current in allowed_previous:
+            self.hset(key, "status", new_status)
+            return 1
+        return -2
+
     def ping(self) -> bool:
         return True
 
