@@ -37,6 +37,12 @@ from aic_common.s3 import (
     report_key,
 )
 
+from aic_common.redis_state import (
+    get_redis_client,
+    set_job_fields,
+    set_job_status,
+)
+
 SERVICE_NAME = "report-service"
 
 logging.basicConfig(
@@ -57,11 +63,7 @@ def build_report(job_id: str, measurement_id: str, result: dict) -> dict:
 
 def connect_redis() -> redis.Redis:
     """Connect to Redis, retrying while the service is unavailable."""
-    client = redis.Redis(
-        host=os.getenv("REDIS_HOST", "redis"),
-        port=int(os.getenv("REDIS_PORT", "6379")),
-        decode_responses=True,
-    )
+    client = get_redis_client()
 
     while True:
         try:
@@ -110,17 +112,20 @@ def process_message(payload: dict, redis_client: redis.Redis, s3_client) -> None
         logger.exception("Could not store report %s for job %s", report["report_id"], job_id)
 
         # Record the failure in Redis before acknowledging the message.
-        redis_client.hset(f"job:{job_id}", mapping={"status": JobStatus.FAILED_REPORT_STORAGE.value})
-
+        set_job_status(redis_client, job_id, JobStatus.FAILED_REPORT_STORAGE)
         raise ReportStorageError(f"Could not store report {report['report_id']}") from exc
 
     # Update only the fields owned by Report Service.
-    redis_client.hset(
-        f"job:{job_id}",
-        mapping={
-            "report_id": report["report_id"],
-            "status": JobStatus.COMPLETED.value,
-        },
+    set_job_fields(
+        redis_client,
+        job_id,
+        {"report_id": report["report_id"]},
+    )
+
+    set_job_status(
+        redis_client,
+        job_id,
+        JobStatus.COMPLETED,
     )
 
     logger.info("Job %s completed", job_id)
